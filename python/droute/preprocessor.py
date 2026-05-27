@@ -14,12 +14,13 @@ from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, Optional
 
+from symfluence.geospatial.geometry_utils import GeospatialUtilsMixin
 from symfluence.models.base import BaseModelPreProcessor
 from .mixins import DRouteConfigMixin
 from .network_adapter import DRouteNetworkAdapter
 
 
-class DRoutePreProcessor(BaseModelPreProcessor, DRouteConfigMixin):  # type: ignore[misc]
+class DRoutePreProcessor(BaseModelPreProcessor, GeospatialUtilsMixin, DRouteConfigMixin):  # type: ignore[misc]
     """
     Spatial preprocessor and configuration generator for the dRoute routing model.
 
@@ -142,12 +143,13 @@ class DRoutePreProcessor(BaseModelPreProcessor, DRouteConfigMixin):  # type: ign
         """
         Load or create network topology for dRoute.
 
-        First checks for existing mizuRoute topology file (enables reuse).
-        Falls back to creating topology from shapefiles if needed.
+        Checks for existing topology files (dRoute's own or mizuRoute's).
+        If none found, generates topology from shapefiles using
+        DRouteTopologyGenerator (no dependency on mizuRoute preprocessing).
         """
         self.logger.info("Setting up dRoute network topology")
 
-        # Try to reuse existing mizuRoute topology
+        # Try to reuse existing topology
         topology_file = self._find_existing_topology()
 
         if topology_file:
@@ -160,13 +162,29 @@ class DRoutePreProcessor(BaseModelPreProcessor, DRouteConfigMixin):  # type: ign
                 self.logger.info(f"Found mizuRoute topology, will reuse: {mizu_topology}")
                 self.topology_path = mizu_topology
             else:
-                # Need to generate topology from scratch
-                self.logger.warning(
-                    "No existing topology found. Please run mizuRoute preprocessing first "
-                    "or provide a topology file."
-                )
-                self.topology_path = None
-                return
+                # Generate topology from shapefiles
+                self.logger.info("No existing topology found. Generating from shapefiles...")
+                try:
+                    from droute.topology_generator import DRouteTopologyGenerator
+
+                    generator = DRouteTopologyGenerator(self)
+                    topology_data = generator.build_and_write()
+                    self.topology_path = generator.get_topology_output_path().with_suffix('.yaml')
+
+                    # Use the generated topology directly (already in dRoute format)
+                    import yaml as _yaml
+                    with open(self.topology_path, encoding='utf-8') as _f:
+                        self.droute_network = _yaml.safe_load(_f)
+
+                    self.logger.info(
+                        f"Generated topology: {topology_data.num_seg} segments, "
+                        f"domain type: {topology_data.domain_type}"
+                    )
+                    return
+                except Exception as e:  # noqa: BLE001 -- model execution resilience
+                    self.logger.error(f"Failed to generate topology from shapefiles: {e}")
+                    self.topology_path = None
+                    return
 
         # Load and convert topology
         if self.topology_path:

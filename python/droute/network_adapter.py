@@ -388,68 +388,58 @@ class DRouteNetworkAdapter:
 
     def validate_topology(self, topology: Dict[str, Any]) -> Tuple[bool, List[str]]:
         """
-        Validate network topology for common issues.
+        Validate and fix network topology issues.
+
+        Fixes cycles using the elevation-based rule from BaseTopologyGenerator,
+        repairs invalid downstream references, and enforces minimum values.
 
         Args:
-            topology: Network topology dictionary
+            topology: Network topology dictionary (modified in place)
 
         Returns:
             Tuple of (is_valid, list of warning messages)
         """
+        import numpy as np
+
         warnings = []
         is_valid = True
 
-        seg_ids = set(topology['seg_ids'])
-        down_seg_ids = topology['down_seg_ids']
+        seg_ids_arr = np.array(topology['seg_ids'])
+        down_seg_ids_arr = np.array(topology['down_seg_ids'])
+        seg_ids_set = set(topology['seg_ids'])
 
-        # Check for disconnected segments
-        for i, down_id in enumerate(down_seg_ids):
-            if down_id != 0 and down_id not in seg_ids:
+        # Fix disconnected segments
+        for i, down_id in enumerate(down_seg_ids_arr):
+            if down_id != 0 and down_id not in seg_ids_set:
                 warnings.append(
-                    f"Segment {topology['seg_ids'][i]} references non-existent "
-                    f"downstream segment {down_id}"
+                    f"Segment {seg_ids_arr[i]} had invalid downstream {down_id} -> fixed to outlet"
                 )
-                is_valid = False
+                down_seg_ids_arr[i] = 0
 
-        # Check for cycles
-        # Simple cycle detection using visited tracking
-        visited = set()
-        for start_idx in range(len(topology['seg_ids'])):
-            path = set()
-            idx = start_idx
-            while idx >= 0 and idx not in visited:
-                if idx in path:
-                    warnings.append(
-                        f"Cycle detected involving segment {topology['seg_ids'][idx]}"
-                    )
-                    is_valid = False
-                    break
-                path.add(idx)
+        # Fix cycles using shared algorithm
+        elevations = np.array(topology.get('elevations', np.zeros(len(seg_ids_arr))))
+        from symfluence.models.utilities.base_topology_generator import BaseTopologyGenerator
+        fixed_down_ids = BaseTopologyGenerator.fix_routing_cycles(
+            seg_ids_arr, down_seg_ids_arr, elevations
+        )
+        n_fixed = np.sum(fixed_down_ids != down_seg_ids_arr)
+        if n_fixed > 0:
+            warnings.append(f"Fixed {n_fixed} cycles using elevation-based rule")
+            topology['down_seg_ids'] = fixed_down_ids.tolist()
+        else:
+            topology['down_seg_ids'] = down_seg_ids_arr.tolist()
 
-                # Find downstream index
-                down_id = down_seg_ids[idx]
-                if down_id == 0:
-                    break
-                try:
-                    idx = list(topology['seg_ids']).index(down_id)
-                except ValueError:
-                    break
-
-            visited.update(path)
-
-        # Check for zero/negative lengths
+        # Fix zero/negative lengths
         for i, length in enumerate(topology['lengths']):
             if length <= 0:
-                warnings.append(
-                    f"Segment {topology['seg_ids'][i]} has invalid length: {length}"
-                )
+                warnings.append(f"Segment {topology['seg_ids'][i]} had invalid length {length} -> set to 1.0")
+                topology['lengths'][i] = 1.0
 
-        # Check for zero/negative slopes
+        # Fix zero/negative slopes
         for i, slope in enumerate(topology['slopes']):
             if slope <= 0:
-                warnings.append(
-                    f"Segment {topology['seg_ids'][i]} has invalid slope: {slope}"
-                )
+                warnings.append(f"Segment {topology['seg_ids'][i]} had invalid slope {slope} -> set to 0.001")
+                topology['slopes'][i] = 0.001
 
         return is_valid, warnings
 

@@ -152,29 +152,27 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         routing_method = self.droute_routing_method
         routing_dt = self.droute_routing_dt
 
-        # Execute routing
-        try:
-            if HAS_DROUTE:
-                # Use dRoute Python bindings
+        # Execute routing (C++ bindings with numpy fallback)
+        routed_flow = None
+        if HAS_DROUTE:
+            try:
                 routed_flow = self._route_with_droute(
-                    runoff_data,
-                    network_config,
-                    routing_method,
-                    routing_dt
+                    runoff_data, network_config, routing_method, routing_dt
                 )
-            else:
-                # Fallback: use numpy-based routing
-                routed_flow = self._route_numpy_fallback(
-                    runoff_data,
-                    network_config,
-                    routing_method,
-                    routing_dt
+            except Exception as e:  # noqa: BLE001
+                self.logger.warning(
+                    f"dRoute C++ bindings failed ({e}), falling back to numpy routing."
                 )
 
-        except Exception as e:  # noqa: BLE001 -- wrap-and-raise to domain error
-            self.logger.error(f"Routing computation failed: {e}")
-            self.logger.debug(traceback.format_exc())
-            raise ModelExecutionError(f"dRoute routing failed: {e}") from e
+        if routed_flow is None:
+            try:
+                routed_flow = self._route_numpy_fallback(
+                    runoff_data, network_config, routing_method, routing_dt
+                )
+            except Exception as e:  # noqa: BLE001
+                self.logger.error(f"Routing computation failed: {e}")
+                self.logger.debug(traceback.format_exc())
+                raise ModelExecutionError(f"dRoute routing failed: {e}") from e
 
         # Save output
         output_dir = self._get_output_dir()
@@ -251,6 +249,9 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
                     'lengths': config['geometry']['lengths'],
                     'widths': config['geometry']['widths'],
                     'hru_to_seg_idx': config['hru_mapping']['hru_to_seg_idx'],
+                    'hru_areas': config['hru_mapping'].get('hru_areas', []),
+                    'hru_ids': config['hru_mapping'].get('hru_ids', []),
+                    'segment_ids': config['network'].get('segment_ids', []),
                 }
                 return network_config
 
@@ -292,6 +293,9 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         """
         Load runoff data from source hydrological model.
 
+        Uses MODEL_CONFIGS for model-specific variable detection and
+        fix_time_precision for time format correction.
+
         Returns:
             Tuple of (runoff_array, time_index) where:
             - runoff_array: 2D array [time, hru] of runoff values
@@ -300,35 +304,45 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         import pandas as pd
         import xarray as xr
 
-        input_dir = self._get_input_dir()
-        self.logger.debug(f"Looking for runoff data in: {input_dir}")
+        from symfluence.models.utilities.runoff_loader import (
+            detect_runoff_variable,
+            fix_time_precision,
+            resolve_runoff_file,
+        )
 
-        # Find runoff file
-        runoff_file = self._find_runoff_file(input_dir)
+        source_model = self.droute_from_model.upper()
+        if source_model == 'DEFAULT':
+            hydro_model = self._get_config_value(lambda: self.config.model.hydrological_model, default='SUMMA')
+            source_model = str(hydro_model).split(',')[0].strip().upper() if ',' in str(hydro_model) else str(hydro_model).strip().upper()
+
+        # Use shared runoff file resolution
+        runoff_file = resolve_runoff_file(
+            source_model=source_model,
+            project_dir=self.project_dir,
+            experiment_id=self.experiment_id,
+            domain_name=self.domain_name,
+            config=self.config,
+        )
+
         if runoff_file is None:
-            self.logger.error(f"No runoff file found in {input_dir}")
+            # Fallback: search input dir directly
+            input_dir = self._get_input_dir()
+            self.logger.debug(f"Shared resolver failed, looking in: {input_dir}")
+            runoff_file = self._find_runoff_file(input_dir)
+
+        if runoff_file is None:
+            self.logger.error("No runoff file found for dRoute")
             return None, None
 
         self.logger.info(f"Loading runoff from: {runoff_file}")
 
+        # Fix time precision before loading
+        fix_time_precision(runoff_file, rounding_freq='h')
+
         try:
             ds = xr.open_dataset(runoff_file)
 
-            # Find runoff variable
-            runoff_vars = ['averageRoutedRunoff', 'scalarTotalRunoff', 'runoff', 'q_runoff']
-            runoff_var = None
-            for var in runoff_vars:
-                if var in ds:
-                    runoff_var = var
-                    break
-
-            if runoff_var is None:
-                # Try to find any variable with 'runoff' in name
-                for var in ds.data_vars:
-                    if 'runoff' in var.lower():
-                        runoff_var = var
-                        break
-
+            runoff_var = detect_runoff_variable(ds, source_model)
             if runoff_var is None:
                 self.logger.error(f"No runoff variable found in {runoff_file}")
                 ds.close()
@@ -336,17 +350,13 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
 
             self.logger.debug(f"Using runoff variable: {runoff_var}")
 
-            # Extract data
             runoff = ds[runoff_var].values
 
-            # Handle dimensions - ensure [time, hru] shape
             if runoff.ndim == 1:
                 runoff = runoff.reshape(-1, 1)
             elif runoff.ndim == 3:
-                # Possibly [time, gru, hru] - sum over HRUs within GRUs
                 runoff = runoff.sum(axis=-1)
 
-            # Get time coordinate
             time_index = pd.DatetimeIndex(ds.time.values)
 
             ds.close()
@@ -386,57 +396,91 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         dt: int
     ) -> np.ndarray:
         """
-        Route runoff using dRoute Python bindings.
+        Route runoff using dRoute C++ bindings (pybind11).
 
-        Args:
-            runoff: 2D array [time, hru] of runoff values
-            network: Network configuration
-            method: Routing method name
-            dt: Routing timestep in seconds
-
-        Returns:
-            2D array [time, segment] of routed streamflow
+        Builds a Network from junctions + reaches, creates a
+        MuskingumCungeRouter, and routes timestep-by-timestep.
         """
         if not HAS_DROUTE:
             raise ImportError("dRoute Python bindings not available")
 
-        # Map HRU runoff to segments
         n_time, n_hru = runoff.shape
         n_segments = network['n_segments']
         hru_to_seg = network['hru_to_seg_idx']
+        downstream_idx = network['downstream_idx']
+        lengths = network['lengths']
+        slopes = network['slopes']
+        hru_areas = np.array(network.get('hru_areas', np.ones(n_hru)))
 
-        # Aggregate runoff to segments
+        # Aggregate runoff to segments (m/s depth rate → m³/s)
         segment_runoff = np.zeros((n_time, n_segments))
         for hru_idx, seg_idx in enumerate(hru_to_seg):
             if seg_idx >= 0 and hru_idx < n_hru:
-                segment_runoff[:, seg_idx] += runoff[:, hru_idx]
+                segment_runoff[:, seg_idx] += runoff[:, hru_idx] * hru_areas[hru_idx]
 
-        # Create dRoute network object
-        net = droute.Network(
-            n_segments=n_segments,
-            downstream=network['downstream_idx'],
-            lengths=network['lengths'],
-            slopes=network['slopes'],
-            widths=network['widths']
-        )
+        # Build Network using the C++ API: junctions + reaches.
+        # Each reach flows from upstream_junction to downstream_junction.
+        # Junction.upstream_reach_ids must list reaches that flow INTO it.
+        net = droute.Network()
 
-        # Create router with specified method
-        method_map = {
-            'muskingum_cunge': droute.RoutingMethod.MUSKINGUM_CUNGE,
-            'irf': droute.RoutingMethod.IRF,
-            'lag': droute.RoutingMethod.LAG,
-            'diffusive_wave': droute.RoutingMethod.DIFFUSIVE_WAVE,
-            'kwt': droute.RoutingMethod.KWT,
-        }
+        outlet_junc_id = n_segments
+        widths = network.get('widths', [None] * n_segments)
+        mannings_n = float(self._get_config_value(
+            lambda: self.config.model.droute.mannings_n if self.config.model and hasattr(self.config.model, 'droute') else None,
+            default=0.035,
+        ))
 
-        if method not in method_map:
-            self.logger.warning(f"Unknown method '{method}', using muskingum_cunge")
-            method = 'muskingum_cunge'
+        # Collect upstream_reach_ids per junction before creating objects
+        junc_upstream: dict = {i: [] for i in range(n_segments + 1)}
+        for i in range(n_segments):
+            ds = downstream_idx[i]
+            ds_junc = ds if ds >= 0 else outlet_junc_id
+            junc_upstream[ds_junc].append(i)
 
-        router = droute.Router(net, method=method_map[method], dt=dt)
+        # Create and add junctions with wiring set upfront
+        for jid in range(n_segments + 1):
+            junc = droute.Junction()
+            junc.id = jid
+            junc.upstream_reach_ids = junc_upstream[jid]
+            net.add_junction(junc)
 
-        # Route flow
-        routed_flow = router.route(segment_runoff)
+        # Create and add reaches
+        for i in range(n_segments):
+            reach = droute.Reach()
+            reach.id = i
+            reach.length = float(lengths[i])
+            reach.slope = max(float(slopes[i]), 0.001)
+            reach.manning_n = mannings_n
+            reach.upstream_junction_id = i
+            ds = downstream_idx[i]
+            reach.downstream_junction_id = ds if ds >= 0 else outlet_junc_id
+
+            if widths[i] is not None:
+                geom = reach.geometry
+                geom.width_coef = float(widths[i])
+                geom.width_exp = 0.0
+                reach.geometry = geom
+
+            net.add_reach(reach)
+
+        net.build_topology()
+        topo_order = net.topological_order()
+        self.logger.info(f"dRoute C++ network built: {net.num_reaches()} reaches, {net.num_junctions()} junctions")
+
+        # Configure router
+        config = droute.RouterConfig()
+        config.dt = float(dt)
+        config.enable_gradients = False
+
+        router = droute.MuskingumCungeRouter(net, config)
+
+        # Route timestep-by-timestep
+        routed_flow = np.zeros((n_time, n_segments))
+        for t in range(n_time):
+            for idx in topo_order:
+                router.set_lateral_inflow(idx, float(segment_runoff[t, idx]))
+            router.route_timestep()
+            routed_flow[t, :] = router.get_all_discharges()
 
         return routed_flow
 
@@ -462,11 +506,12 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         lengths = np.array(network['lengths'])
         slopes = np.array(network['slopes'])
 
-        # Aggregate runoff to segments
+        # Aggregate runoff to segments (convert m/s depth rate to m³/s)
+        hru_areas = np.array(network.get('hru_areas', np.ones(n_hru)))
         segment_runoff = np.zeros((n_time, n_segments))
         for hru_idx, seg_idx in enumerate(hru_to_seg):
             if seg_idx >= 0 and hru_idx < n_hru:
-                segment_runoff[:, seg_idx] += runoff[:, hru_idx]
+                segment_runoff[:, seg_idx] += runoff[:, hru_idx] * hru_areas[hru_idx]
 
         # Simple Muskingum routing
         # Q_out = C1*I + C2*I_prev + C3*Q_prev
