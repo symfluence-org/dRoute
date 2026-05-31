@@ -630,6 +630,8 @@ inline void MuskingumCungeRouter::enable_gradients(bool enable) {
 inline void MuskingumCungeRouter::start_recording() {
     if (!config_.enable_gradients || !AD_ENABLED) return;
     
+    reset_tape();  // clear the global CoDiPack tape so successive recording sessions
+                   // (e.g. gradient-descent epochs) don't accumulate and exhaust memory
     activate_tape();
     recording_ = true;
     
@@ -1288,6 +1290,8 @@ inline void IRFRouter::enable_gradients(bool enable) {
 inline void IRFRouter::start_recording() {
     if (!config_.enable_gradients || !AD_ENABLED) return;
     
+    reset_tape();  // clear the global CoDiPack tape so successive recording sessions
+                   // (e.g. gradient-descent epochs) don't accumulate and exhaust memory
     activate_tape();
     recording_ = true;
     
@@ -1777,6 +1781,8 @@ inline void DiffusiveWaveRouter::enable_gradients(bool enable) {
 inline void DiffusiveWaveRouter::start_recording() {
     if (!config_.enable_gradients || !AD_ENABLED) return;
     
+    reset_tape();  // clear the global CoDiPack tape so successive recording sessions
+                   // (e.g. gradient-descent epochs) don't accumulate and exhaust memory
     activate_tape();
     recording_ = true;
     
