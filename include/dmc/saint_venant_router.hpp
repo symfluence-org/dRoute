@@ -231,6 +231,9 @@ private:
     std::vector<ReachState> reach_states_;
     std::vector<SVEGeometry> reach_geometry_;
     std::vector<double> lateral_inflows_;  // [m³/s] per reach
+    // Per-timestep snapshot of lateral_inflows_ during recording, so the finite-
+    // difference gradient can replay the exact time-varying forcing.
+    std::vector<std::vector<double>> lateral_history_;
     
     // Output history for gradient computation
     std::unordered_map<int, std::vector<double>> output_history_;
@@ -599,6 +602,8 @@ inline int SaintVenantRouter::jac_callback(sunrealtype t, N_Vector y, N_Vector f
 #endif
 
 inline void SaintVenantRouter::route_timestep() {
+    // Snapshot the lateral forcing used for this step so the FD gradient can replay it.
+    if (recording_) lateral_history_.push_back(lateral_inflows_);
 #ifdef DMC_ENABLE_SUNDIALS
     // Advance CVODES from current_time to current_time + dt
     sunrealtype tout = current_time_ + config_.dt;
@@ -758,6 +763,7 @@ inline void SaintVenantRouter::reset_state() {
 inline void SaintVenantRouter::start_recording() {
     recording_ = true;
     output_history_.clear();
+    lateral_history_.clear();
     std::fill(grad_manning_n_.begin(), grad_manning_n_.end(), 0.0);
 }
 
@@ -785,45 +791,64 @@ inline void SaintVenantRouter::compute_gradients_timeseries(
     }
     
     const auto& recorded = it->second;
-    if (dL_dQ.size() != recorded.size()) {
+    const size_t nT = recorded.size();
+    if (dL_dQ.size() != nT) {
         std::cerr << "dL_dQ size mismatch" << std::endl;
         return;
     }
-    
-    // Compute gradient via finite difference
-    double eps = 0.001;
-    int n_reaches = reach_geometry_.size();
+    if (lateral_history_.size() < nT) {
+        std::cerr << "lateral history (" << lateral_history_.size()
+                  << ") shorter than recorded outputs (" << nT
+                  << "); cannot compute gradients" << std::endl;
+        return;
+    }
+
+    // Central finite-difference gradient. The perturbed runs must replay the SAME
+    // time-varying lateral forcing as the recorded forward pass (previously the
+    // forcing was not re-applied, so the perturbed run used a constant inflow and the
+    // gradient came out with the wrong sign and magnitude). Disable recording during
+    // the replays so they don't append to the history.
+    const double eps = 1e-5;
+    const int n_reaches = static_cast<int>(reach_geometry_.size());
     const auto& topo_order = network_.topological_order();
-    
+    const bool was_recording = recording_;
+    recording_ = false;
+
+    auto replay = [&]() {
+        reset_state();
+        std::vector<double> sim;
+        sim.reserve(nT);
+        for (size_t t = 0; t < nT; ++t) {
+            lateral_inflows_ = lateral_history_[t];   // replay exact forcing
+            route_timestep();
+            sim.push_back(get_discharge(reach_id));
+        }
+        return sim;
+    };
+
     for (int r = 0; r < n_reaches; ++r) {
-        double n_orig = reach_geometry_[r].manning_n;
-        
-        // Perturb Manning's n
+        const double n_orig = reach_geometry_[r].manning_n;
+
         reach_geometry_[r].manning_n = n_orig + eps;
         network_.get_reach(topo_order[r]).manning_n = Real(n_orig + eps);
-        
-        // Re-run simulation
-        reset_state();
-        std::vector<double> sim_plus;
-        for (size_t t = 0; t < recorded.size(); ++t) {
-            // Would need to re-set lateral inflows here - simplified
-            route_timestep();
-            sim_plus.push_back(get_discharge(reach_id));
-        }
-        
-        // Restore
+        std::vector<double> sim_plus = replay();
+
+        reach_geometry_[r].manning_n = n_orig - eps;
+        network_.get_reach(topo_order[r]).manning_n = Real(n_orig - eps);
+        std::vector<double> sim_minus = replay();
+
         reach_geometry_[r].manning_n = n_orig;
         network_.get_reach(topo_order[r]).manning_n = Real(n_orig);
-        
-        // Compute gradient contribution
+
         double grad = 0.0;
-        for (size_t t = 0; t < recorded.size(); ++t) {
-            double dQ_dn = (sim_plus[t] - recorded[t]) / eps;
+        for (size_t t = 0; t < nT; ++t) {
+            const double dQ_dn = (sim_plus[t] - sim_minus[t]) / (2.0 * eps);
             grad += dL_dQ[t] * dQ_dn;
         }
         grad_manning_n_[r] = grad;
     }
-    
+
+    recording_ = was_recording;
     reset_state();
 }
 
