@@ -580,7 +580,23 @@ static double routing_objective(
                         Must have same length as recorded outputs.
              )doc",
              py::arg("reach_id"), py::arg("dL_dQ"))
-         
+         .def("compute_gradients_timeseries",
+             py::overload_cast<const std::vector<int>&,
+                               const std::vector<std::vector<double>>&>(
+                 &MuskingumCungeRouter::compute_gradients_timeseries),
+             R"doc(
+             Compute gradients for full timeseries at multiple gauge reaches.
+
+             Seeds the adjoint at every gauge and performs a single reverse pass,
+             so the returned gradients are w.r.t. a loss summed over all gauges.
+
+             Args:
+                 reach_ids: list of reach IDs with observations.
+                 dL_dQ: list (one per reach) of per-timestep loss gradients; each
+                        inner list must match the recorded-output length.
+             )doc",
+             py::arg("reach_ids"), py::arg("dL_dQ"))
+
          // State serialization for checkpointing
          .def("save_state", &MuskingumCungeRouter::save_state,
              "Save current router state for checkpointing")
