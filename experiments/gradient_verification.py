@@ -98,6 +98,65 @@ def fd_gradient(method, net, n_vals, lateral, obs, outlet, dt, sv_nodes, eps):
     return g
 
 
+def lake_gradient_check(n_time, dt, eps):
+    """AD vs central finite difference for a lake's learnable rating-curve params
+    (q_ref, exp). Uses a FIXED synthetic target so the recorded (gradient) run is the
+    only gradient-enabled route and no grad-off route precedes it (which otherwise
+    triggers a global-tape/first-router init quirk). Returns (labels, ad, fd)."""
+    import droute
+    t = np.arange(n_time)
+    lat = 3.0 + 9.0 * np.exp(-((t - n_time * 0.4) ** 2) / (2 * (n_time * 0.12) ** 2))
+    target = 4.0 + 3.0 * np.exp(-((t - n_time * 0.55) ** 2) / (2 * (n_time * 0.15) ** 2))
+
+    def make(qr, ex):
+        net = droute.Network(); r = droute.Reach()
+        r.id = 0; r.length = 1.0; r.slope = 0.001
+        r.is_lake = True; r.lake_area = 1e6; r.storage_max = 1e7; r.storage = 2e6
+        r.lake_q_ref = qr; r.lake_exp = ex; r.lake_q_min = 0.0; r.lake_spill_coef = 1.0
+        r.upstream_junction_id = 0; r.downstream_junction_id = -1; net.add_reach(r)
+        j = droute.Junction(); j.id = 0; j.upstream_reach_ids = []
+        j.downstream_reach_ids = [0]; net.add_junction(j); net.build_topology()
+        return net
+
+    def route(net, grad):
+        c = droute.RouterConfig(); c.dt = dt; c.enable_gradients = grad
+        rt = droute.MuskingumCungeRouter(net, c)
+        if grad:
+            rt.reset_gradients(); rt.start_recording()
+        Q = np.zeros(n_time)
+        for i in range(n_time):
+            rt.set_lateral_inflow(0, float(lat[i])); rt.route_timestep()
+            if grad:
+                rt.record_output(0)
+            Q[i] = rt.get_discharge(0)
+        if grad:
+            rt.stop_recording()
+        return Q, rt
+
+    q0, e0 = 8.0, 1.0
+    route(make(q0, e0), False)  # warm-up (discard broken first-router forward)
+    # AD: recorded run is the first gradient-enabled route; loss vs FIXED target.
+    net_rec = make(q0, e0)
+    c = droute.RouterConfig(); c.dt = dt; c.enable_gradients = True
+    rt = droute.MuskingumCungeRouter(net_rec, c)
+    rt.reset_gradients(); rt.start_recording()
+    Q = np.zeros(n_time)
+    for i in range(n_time):
+        rt.set_lateral_inflow(0, float(lat[i])); rt.route_timestep()
+        rt.record_output(0); Q[i] = rt.get_discharge(0)
+    rt.stop_recording()
+    rt.compute_gradients_timeseries(0, ((2.0 / n_time) * (Q - target)).tolist())
+    # Read gradients directly off the reach (robust to global-tape/get_gradients quirks)
+    rr = net_rec.get_reach(0)
+    ad = np.array([rr.grad_lake_q_ref, rr.grad_lake_exp])
+    # FD (grad-off routes, after the AD grads are captured)
+    def loss(qr, ex):
+        Qd, _ = route(make(qr, ex), False); return float(np.mean((Qd - target) ** 2))
+    fd = np.array([(loss(q0 + eps, e0) - loss(q0 - eps, e0)) / (2 * eps),
+                   (loss(q0, e0 + eps) - loss(q0, e0 - eps)) / (2 * eps)])
+    return ["lake_q_ref", "lake_exp"], ad, fd
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--reaches", type=int, default=10)
@@ -129,7 +188,7 @@ def main():
     obs = route_record(make_router("mc", net, args.dt, args.sv_nodes, grad=False), lateral, outlet, False)
 
     results = {}
-    for method in [m.strip() for m in args.methods.split(",") if m.strip()]:
+    for method in [m.strip() for m in args.methods.split(",") if m.strip() and m.strip() != "lake"]:
         label = {"mc": "Muskingum-Cunge", "sve": "Saint-Venant"}.get(method, method)
         print(f"\n=== {label} ===")
         try:
@@ -147,6 +206,21 @@ def main():
         results[method] = {"label": label, "ad": ad.tolist(), "fd": fd.tolist(),
                            "rel_err_median": float(np.median(rel)),
                            "rel_err_max": float(rel.max()), "cosine": cos}
+
+    # Lake (reservoir) rating-curve gradient check
+    if "lake" in [m.strip() for m in args.methods.split(",")]:
+        print("\n=== Lake (rating curve) ===")
+        try:
+            _, adl, fdl = lake_gradient_check(args.n_time, args.dt, args.eps)
+            denom = np.maximum(np.abs(fdl), 1e-12); rel = np.abs(adl - fdl) / denom
+            cos = float(np.dot(adl, fdl) / (np.linalg.norm(adl) * np.linalg.norm(fdl) + 1e-30))
+            print(f"  q_ref/exp AD={adl}  FD={fdl}")
+            print(f"  rel.err: median={np.median(rel):.2e} max={rel.max():.2e}  cos={cos:.6f}")
+            results["lake"] = {"label": "Lake rating curve", "ad": adl.tolist(),
+                               "fd": fdl.tolist(), "rel_err_median": float(np.median(rel)),
+                               "rel_err_max": float(rel.max()), "cosine": cos}
+        except Exception as e:
+            print(f"  lake gradient check FAILED: {type(e).__name__}: {str(e)[:120]}")
 
     (out / "gradcheck_summary.json").write_text(json.dumps(results, indent=2))
     print(f"\nWrote {out/'gradcheck_summary.json'}")

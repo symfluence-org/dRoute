@@ -101,6 +101,46 @@ struct Reach {
     double grad_width_exp = 0.0;
     double grad_depth_coef = 0.0;
     double grad_depth_exp = 0.0;
+
+    // ===== Lake / reservoir extension =====
+    // When is_lake is true this reach routes via a storage-discharge rating curve
+    // (dS/dt = inflow - Q(S)) instead of the Muskingum-Cunge channel update.
+    bool is_lake = false;
+    int  lake_type = 0;             // 0 = natural lake, 1 = reservoir (regulated)
+    // Fixed geometry (from HydroLAKES: Lake_area, Vol_total/Depth_avg)
+    double lake_area = 0.0;         // surface area A [m^2]
+    double storage_max = 0.0;       // S_max [m^3] (full-supply / total volume)
+    // Storage state
+    Real storage = 0.0;             // S [m^3]
+    Real storage_prev = 0.0;
+    // Learnable rating-curve parameters (Q_out = q_min + (q_ref-q_min)*frac^exp + spill):
+    //   natural lake  -> q_min=0, exp~1.5 (weir-like)
+    //   reservoir     -> q_min=min release, q_ref=target release, all learnable
+    Real lake_q_ref = 0.0;          // reference/target outflow [m^3/s]  (init: HydroLAKES Dis_avg)
+    Real lake_exp = 1.5;            // rating exponent
+    Real lake_q_min = 0.0;          // minimum (regulated) release [m^3/s]
+    Real lake_s_dead = 0.0;         // dead storage [m^3] (no release below this)
+    Real lake_spill_coef = 1.0;     // fraction of above-full storage spilled per step
+    // Gradient storage for lake params
+    double grad_lake_q_ref = 0.0;
+    double grad_lake_exp = 0.0;
+    double grad_lake_q_min = 0.0;
+    double grad_lake_spill_coef = 0.0;
+
+    // ===== Subgrid (off-network) lake store =====
+    // For a CHANNEL reach: a fraction of the catchment's lateral inflow first passes
+    // through aggregated small lakes (storage-discharge) before entering the channel,
+    // representing off-network HydroLAKES that attenuate local runoff. Differentiable;
+    // q_ref/exp are learnable.
+    bool has_subgrid_lake = false;
+    double subgrid_lake_frac = 0.0;      // fraction of lateral inflow routed through lakes [0,1]
+    double subgrid_storage_max = 0.0;    // S_max of the aggregate subgrid store [m^3]
+    Real subgrid_storage = 0.0;          // state [m^3]
+    Real subgrid_storage_prev = 0.0;
+    Real subgrid_q_ref = 0.0;            // reference outflow [m^3/s] (learnable)
+    Real subgrid_exp = 1.0;              // rating exponent (learnable)
+    double grad_subgrid_q_ref = 0.0;
+    double grad_subgrid_exp = 0.0;
 };
 
 /**
@@ -195,11 +235,23 @@ inline const Junction& Network::get_junction(int id) const {
 inline std::vector<Real*> Network::get_all_parameters() {
     std::vector<Real*> params;
     for (auto& [id, reach] : reaches_) {
-        params.push_back(&reach.manning_n);
-        params.push_back(&reach.geometry.width_coef);
-        params.push_back(&reach.geometry.width_exp);
-        params.push_back(&reach.geometry.depth_coef);
-        params.push_back(&reach.geometry.depth_exp);
+        if (reach.is_lake) {
+            // Learnable lake/reservoir rating-curve parameters
+            params.push_back(&reach.lake_q_ref);
+            params.push_back(&reach.lake_exp);
+            params.push_back(&reach.lake_q_min);
+            params.push_back(&reach.lake_spill_coef);
+        } else {
+            params.push_back(&reach.manning_n);
+            params.push_back(&reach.geometry.width_coef);
+            params.push_back(&reach.geometry.width_exp);
+            params.push_back(&reach.geometry.depth_coef);
+            params.push_back(&reach.geometry.depth_exp);
+            if (reach.has_subgrid_lake) {
+                params.push_back(&reach.subgrid_q_ref);
+                params.push_back(&reach.subgrid_exp);
+            }
+        }
     }
     return params;
 }
@@ -208,22 +260,44 @@ inline std::vector<std::string> Network::get_parameter_names() {
     std::vector<std::string> names;
     for (auto& [id, reach] : reaches_) {
         std::string prefix = "reach_" + std::to_string(id) + "_";
-        names.push_back(prefix + "manning_n");
-        names.push_back(prefix + "width_coef");
-        names.push_back(prefix + "width_exp");
-        names.push_back(prefix + "depth_coef");
-        names.push_back(prefix + "depth_exp");
+        if (reach.is_lake) {
+            names.push_back(prefix + "lake_q_ref");
+            names.push_back(prefix + "lake_exp");
+            names.push_back(prefix + "lake_q_min");
+            names.push_back(prefix + "lake_spill_coef");
+        } else {
+            names.push_back(prefix + "manning_n");
+            names.push_back(prefix + "width_coef");
+            names.push_back(prefix + "width_exp");
+            names.push_back(prefix + "depth_coef");
+            names.push_back(prefix + "depth_exp");
+            if (reach.has_subgrid_lake) {
+                names.push_back(prefix + "subgrid_q_ref");
+                names.push_back(prefix + "subgrid_exp");
+            }
+        }
     }
     return names;
 }
 
 inline void Network::collect_gradients() {
     for (auto& [id, reach] : reaches_) {
-        reach.grad_manning_n = get_gradient(reach.manning_n);
-        reach.grad_width_coef = get_gradient(reach.geometry.width_coef);
-        reach.grad_width_exp = get_gradient(reach.geometry.width_exp);
-        reach.grad_depth_coef = get_gradient(reach.geometry.depth_coef);
-        reach.grad_depth_exp = get_gradient(reach.geometry.depth_exp);
+        if (reach.is_lake) {
+            reach.grad_lake_q_ref = get_gradient(reach.lake_q_ref);
+            reach.grad_lake_exp = get_gradient(reach.lake_exp);
+            reach.grad_lake_q_min = get_gradient(reach.lake_q_min);
+            reach.grad_lake_spill_coef = get_gradient(reach.lake_spill_coef);
+        } else {
+            reach.grad_manning_n = get_gradient(reach.manning_n);
+            reach.grad_width_coef = get_gradient(reach.geometry.width_coef);
+            reach.grad_width_exp = get_gradient(reach.geometry.width_exp);
+            reach.grad_depth_coef = get_gradient(reach.geometry.depth_coef);
+            reach.grad_depth_exp = get_gradient(reach.geometry.depth_exp);
+            if (reach.has_subgrid_lake) {
+                reach.grad_subgrid_q_ref = get_gradient(reach.subgrid_q_ref);
+                reach.grad_subgrid_exp = get_gradient(reach.subgrid_exp);
+            }
+        }
     }
 }
 
