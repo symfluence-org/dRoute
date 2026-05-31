@@ -461,8 +461,12 @@ inline void SaintVenantRouter::compute_rhs(double t, const double* y, double* yd
         double dx = reach.length / (n_nodes - 1);
         int off = reach_state_offset_[r];
         
-        // Get lateral inflow per unit length
-        double q_lat = lateral_inflows_[r] / reach.length;
+        // Lateral inflow as a per-cell source. The continuity source is applied at all
+        // n_nodes cells of width dx, so dividing by reach.length over-integrates the
+        // source by n_nodes/(n_nodes-1) (the n_nodes cells span n_nodes*dx, not length).
+        // Normalize by the discretized length n_nodes*dx so the source integrates to
+        // exactly lateral_inflows_[r] and mass is conserved.
+        double q_lat = lateral_inflows_[r] / (n_nodes * dx);
         
         // Boundary condition: upstream inflow
         double Q_upstream = 0.0;
@@ -481,9 +485,13 @@ inline void SaintVenantRouter::compute_rhs(double t, const double* y, double* yd
             }
         }
         
-        // Add lateral inflow contribution
-        Q_upstream += lateral_inflows_[r] * 0.5;  // Half at inlet
-        
+        // NOTE: lateral inflow enters ONLY through the distributed continuity source
+        // q_lat below (which integrates to the full lateral_inflows_[r] over the reach).
+        // The inlet boundary carries upstream reach outflow only. Previously a spurious
+        // "0.5 * lateral at the inlet" term was added here on top of the distributed
+        // source, double-counting lateral inflow (~1.5x per reach, compounding downstream)
+        // and breaking mass conservation.
+
         // Interior nodes: finite volume update
         for (int j = 0; j < n_nodes; ++j) {
             double A_j = std::max(y[off + 2*j], config_.min_area);
