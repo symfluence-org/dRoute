@@ -20,13 +20,30 @@ class DRouteParameterManager(BaseParameterManager):
     """
     Parameter manager for dRoute routing calibration.
 
-    Manages five core routing parameters:
+    Manages core routing parameters:
     - velocity: Base flow velocity (m/s)
     - diffusivity: Diffusion coefficient (m2/s)
     - muskingum_k: Muskingum storage constant (hours)
     - muskingum_x: Muskingum weighting factor (dimensionless)
     - manning_n: Manning's roughness coefficient (dimensionless)
+
+    Reservoir operating-rule parameters (global, applied to every inline
+    reservoir; the worker scales each reservoir's HydroLAKES-initialised values):
+    - reservoir_q_ref_mult: multiplier on each reservoir's reference release q_ref
+    - reservoir_exp:        storage-discharge rating exponent
+    - reservoir_q_min_frac: minimum regulated release as a fraction of q_ref
+    - reservoir_spill_coef: above-full spill coefficient
     """
+
+    # Default bounds for the global reservoir operating-rule parameters. These are
+    # not in the shared SYMFLUENCE droute-bounds registry, so provide them here
+    # (still overridable via the DROUTE_PARAM_BOUNDS config key).
+    RESERVOIR_BOUNDS = {
+        'reservoir_q_ref_mult': {'min': 0.2, 'max': 5.0, 'transform': 'log'},
+        'reservoir_exp': {'min': 1.0, 'max': 3.0, 'transform': 'none'},
+        'reservoir_q_min_frac': {'min': 0.0, 'max': 0.5, 'transform': 'none'},
+        'reservoir_spill_coef': {'min': 0.1, 'max': 3.0, 'transform': 'none'},
+    }
 
     def __init__(self, config: Dict, logger: logging.Logger, settings_dir: Path):
         super().__init__(config, logger, settings_dir)
@@ -62,6 +79,8 @@ class DRouteParameterManager(BaseParameterManager):
         for param in self.droute_params:
             if param in registry_bounds:
                 bounds[param] = registry_bounds[param]
+            elif param in self.RESERVOIR_BOUNDS:
+                bounds[param] = dict(self.RESERVOIR_BOUNDS[param])
             else:
                 self.logger.warning(
                     f"No bounds found for dRoute param '{param}', using [0, 1]"

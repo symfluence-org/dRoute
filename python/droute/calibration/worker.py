@@ -172,6 +172,9 @@ class DRouteWorker(BaseWorker):
             # Load network configuration
             settings_dir = project_dir / 'settings' / 'dRoute'
             network_config_path = settings_dir / 'droute_network.yaml'
+            # lake/reservoir operating-rule config (optional)
+            lake_cfg = settings_dir / 'droute_lakes.yaml'
+            self._lake_config_path = lake_cfg if lake_cfg.exists() else None
 
             if network_config_path.exists():
                 import yaml
@@ -186,6 +189,8 @@ class DRouteWorker(BaseWorker):
                     'lengths': config['geometry']['lengths'],
                     'widths': config['geometry']['widths'],
                     'hru_to_seg_idx': config['hru_mapping']['hru_to_seg_idx'],
+                    # segment ids (LINKNO) needed to map lake/reservoir config -> reach index
+                    'segment_ids': config['network'].get('segment_ids'),
                 }
             else:
                 self.logger.warning("Network config not found, trying mizuRoute topology")
@@ -311,6 +316,109 @@ class DRouteWorker(BaseWorker):
             self.logger.debug(traceback.format_exc())
             return False
 
+    # Global reservoir operating-rule parameters this worker understands.
+    RESERVOIR_PARAM_KEYS = (
+        'reservoir_q_ref_mult', 'reservoir_exp', 'reservoir_q_min_frac', 'reservoir_spill_coef'
+    )
+
+    def _apply_reservoir_operating_rules(self, net, segid_to_index, params, lake_cls) -> int:
+        """Apply GLOBAL reservoir operating-rule params to every inline reservoir.
+
+        Each reservoir's HydroLAKES-initialised q_ref is scaled by
+        reservoir_q_ref_mult; exp/spill are set globally; q_min is set as a
+        fraction of the (scaled) q_ref. Returns the number of reservoirs modified.
+        """
+        q_ref_mult = float(params.get('reservoir_q_ref_mult', 1.0))
+        exp = params.get('reservoir_exp')
+        q_min_frac = params.get('reservoir_q_min_frac')
+        spill = params.get('reservoir_spill_coef')
+        n = 0
+        for seg, rec in (lake_cls.get('inline') or {}).items():
+            if int(rec.get('lake_type', 0)) != 1:        # reservoirs only (type 1)
+                continue
+            i = segid_to_index.get(int(seg))
+            if i is None:
+                continue
+            r = net.get_reach(i)
+            r.lake_q_ref = float(r.lake_q_ref) * q_ref_mult
+            if exp is not None:
+                r.lake_exp = float(exp)
+            if spill is not None:
+                r.lake_spill_coef = float(spill)
+            if q_min_frac is not None:
+                r.lake_q_min = float(q_min_frac) * float(r.lake_q_ref)
+            n += 1
+        return n
+
+    def _route_cpp_with_lakes(self, params: Dict[str, float]) -> Optional[np.ndarray]:
+        """Route through the C++ Muskingum-Cunge router with lake/reservoir routing.
+
+        Required for reservoir operating-rule params to affect the objective (the
+        pure-Python fallback ignores lakes). Returns per-segment discharge
+        (n_time, n_seg) indexed by reach/segment, or None if prerequisites missing.
+        """
+        if not HAS_DROUTE:
+            return None
+        nc = self._network_config
+        seg_ids = nc.get('segment_ids')
+        if seg_ids is None:
+            self.logger.warning("Network config has no segment_ids; cannot apply lakes (C++ path skipped)")
+            return None
+        import yaml
+        from droute.lake_preprocessor import apply_lake_config_to_network
+
+        n_time, n_hru = self._runoff_data.shape
+        n_seg = nc['n_segments']
+        hru_to_seg = nc['hru_to_seg_idx']
+        downstream = np.asarray(nc['downstream_idx'], dtype=int)
+        lengths = np.asarray(nc['lengths'], dtype=float)
+        slopes = np.asarray(nc['slopes'], dtype=float)
+        id_to_idx = {int(s): i for i, s in enumerate(seg_ids)}
+        manning = float(params.get('manning_n', 0.035))
+
+        seg_runoff = np.zeros((n_time, n_seg))
+        for hru_idx, seg_idx in enumerate(hru_to_seg):
+            if seg_idx >= 0 and hru_idx < n_hru:
+                seg_runoff[:, seg_idx] += self._runoff_data[:, hru_idx]
+
+        # build network
+        outlet_junc = n_seg
+        junc_up = {i: [] for i in range(n_seg + 1)}
+        for i in range(n_seg):
+            d = int(downstream[i]); junc_up[d if d >= 0 else outlet_junc].append(i)
+        net = droute.Network()
+        for jid in range(n_seg + 1):
+            j = droute.Junction(); j.id = jid; j.upstream_reach_ids = junc_up[jid]; net.add_junction(j)
+        for i in range(n_seg):
+            r = droute.Reach(); r.id = i; r.length = float(lengths[i])
+            r.slope = max(float(slopes[i]), 0.001); r.manning_n = manning
+            r.upstream_junction_id = i
+            d = int(downstream[i]); r.downstream_junction_id = d if d >= 0 else outlet_junc
+            net.add_reach(r)
+        net.build_topology()
+
+        # apply lakes + global reservoir operating-rule params
+        if self._lake_config_path is not None:
+            with open(self._lake_config_path, encoding='utf-8') as f:
+                raw = yaml.safe_load(f) or {}
+            lake_cls = {'inline': raw.get('inline_lakes', {}) or {},
+                        'subgrid': raw.get('subgrid_lakes', {}) or {}}
+            apply_lake_config_to_network(net, lake_cls, id_to_idx, logger=self.logger)
+            if any(k in params for k in self.RESERVOIR_PARAM_KEYS):
+                nres = self._apply_reservoir_operating_rules(net, id_to_idx, params, lake_cls)
+                self.logger.debug(f"Applied reservoir operating rules to {nres} reservoirs")
+
+        cfg = droute.RouterConfig(); cfg.dt = float(self.routing_dt); cfg.enable_gradients = False
+        router = droute.MuskingumCungeRouter(net, cfg)
+        order = np.asarray(net.topological_order(), dtype=int)
+        routed = np.zeros((n_time, n_seg))
+        for t in range(n_time):
+            for idx in order:
+                router.set_lateral_inflow(int(idx), float(seg_runoff[t, idx]))
+            router.route_timestep()
+            routed[t, order] = router.get_all_discharges()   # get_all_discharges() is topo-ordered
+        return routed
+
     def _route_with_params(self, params: Dict[str, float]) -> Optional[np.ndarray]:
         """
         Execute routing with given parameters.
@@ -323,6 +431,14 @@ class DRouteWorker(BaseWorker):
         """
         if self._runoff_data is None or self._network_config is None:
             return None
+
+        # Prefer the C++ router when a lake/reservoir config is present (required for
+        # reservoir operating-rule params to take effect); fall back to pure-Python MC.
+        if getattr(self, '_lake_config_path', None) is not None or \
+                any(k in params for k in self.RESERVOIR_PARAM_KEYS):
+            routed = self._route_cpp_with_lakes(params)
+            if routed is not None:
+                return routed
 
         n_time, n_hru = self._runoff_data.shape
         n_segments = self._network_config['n_segments']
