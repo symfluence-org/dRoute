@@ -113,25 +113,29 @@ def route_multi(net, lateral, gauges, dt=3600.0, record=False):
 
 
 def mean_kge(sim, obs, warmup):
-    return float(np.mean([kge(sim[warmup:, gi], obs[warmup:, gi])
-                          for gi in range(sim.shape[1])]))
+    # average only over gauges with valid (finite) skill — real obs are gappy, so a
+    # gauge with no data in the window returns -inf and must not poison the mean
+    vals = [kge(sim[warmup:, gi], obs[warmup:, gi]) for gi in range(sim.shape[1])]
+    finite = [v for v in vals if np.isfinite(v)]
+    return float(np.mean(finite)) if finite else -1e6
 
 
 def mean_nse(sim, obs, warmup):
-    return float(np.mean([nse(sim[warmup:, gi], obs[warmup:, gi])
-                          for gi in range(sim.shape[1])]))
+    vals = [nse(sim[warmup:, gi], obs[warmup:, gi]) for gi in range(sim.shape[1])]
+    finite = [v for v in vals if np.isfinite(v)]
+    return float(np.mean(finite)) if finite else -1e6
 
 
-def evaluate(net, n_vals, lateral, obs, gauges, warmup):
+def evaluate(net, n_vals, lateral, obs, gauges, warmup, dt=3600.0):
     set_manning(net, n_vals)
-    sim, _ = route_multi(net, lateral, gauges)
+    sim, _ = route_multi(net, lateral, gauges, dt)
     return {"kge": mean_kge(sim, obs, warmup), "nse": mean_nse(sim, obs, warmup), "sim": sim}
 
 
 # ---------------------------------------------------------------------------
 # Multi-gauge DDS and Adam
 # ---------------------------------------------------------------------------
-def run_dds_multi(net, lateral, obs, gauges, warmup, groups, max_evals, seeds):
+def run_dds_multi(net, lateral, obs, gauges, warmup, groups, max_evals, seeds, dt=3600.0):
     n_params = int(groups.max()) + 1
     curves, best_kge, best_n = [], -np.inf, None
     for s in seeds:
@@ -139,7 +143,7 @@ def run_dds_multi(net, lateral, obs, gauges, warmup, groups, max_evals, seeds):
 
         def objective(x01):
             set_manning(net, expand(N_MIN + x01 * (N_MAX - N_MIN), groups))
-            sim, _ = route_multi(net, lateral, gauges)
+            sim, _ = route_multi(net, lateral, gauges, dt)
             return 1.0 - mean_kge(sim, obs, warmup)
 
         x_best, f_best, hist = dds(objective, n_params, max_evals, rng)
