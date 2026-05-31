@@ -247,7 +247,20 @@ public:
      * Returns the outflow Q(t+Δt).
      */
     Real route_reach(Reach& reach, double dt);
-    
+
+    /**
+     * Route a lake/reservoir reach for one timestep via a differentiable
+     * storage-discharge rating curve. Updates reach.storage and returns Q(t+Δt).
+     */
+    Real route_lake(Reach& reach, double dt);
+
+    /**
+     * Pass a fraction of a channel reach's lateral inflow through an aggregated
+     * subgrid (off-network) lake store and return the effective lateral inflow.
+     * Updates reach.subgrid_storage. Differentiable.
+     */
+    Real apply_subgrid_lake(Reach& reach, double dt);
+
     /**
      * Route entire network for one timestep.
      * Processes reaches in topological order.
@@ -591,8 +604,74 @@ inline Real MuskingumCungeRouter::route_reach(Reach& reach, double dt) {
     
     // Ensure non-negative
     outflow = safe_max(outflow, Real(config_.min_flow));
-    
+
     return outflow;
+}
+
+inline Real MuskingumCungeRouter::route_lake(Reach& reach, double dt) {
+    // Differentiable storage-discharge lake/reservoir routing.
+    //   mass balance: dS/dt = I - Q(S)
+    //   rating curve: Q(S) = q_min + (q_ref - q_min) * frac^exp + spill
+    //                 frac = clamp((S - s_dead)/(S_max - s_dead), 0, 1)
+    //                 spill = spill_coef * max(S - S_max, 0)/dt   (flood release)
+    // Natural lakes use q_min=0 (weir-like exp); reservoirs use a regulated q_min and
+    // a learnable target q_ref/exp. All rating params carry gradients (registered in
+    // get_all_parameters); thresholds use smooth max/min for AD.
+    const int nsub = (config_.num_substeps > 1) ? config_.num_substeps : 4;
+    const double sub_dt = dt / nsub;
+
+    Real S = reach.storage;
+    const Real I = reach.inflow_curr + reach.lateral_inflow;   // total inflow [m^3/s]
+    const Real Smax = Real(reach.storage_max > 0.0 ? reach.storage_max : 1.0);
+    const Real Sdead = reach.lake_s_dead;
+    // NOTE: safe_max/safe_min are templated on a single type, and CoDiPack arithmetic
+    // yields expression types, so wrap each arithmetic argument in Real(...) so both
+    // operands deduce to Real.
+    const Real denom = safe_max(Real(Smax - Sdead), Real(1.0));
+
+    Real Qsum = Real(0.0);
+    for (int k = 0; k < nsub; ++k) {
+        // active-storage fraction in [0, 1] (smoothly clamped)
+        Real frac = safe_max(Real(S - Sdead), Real(0.0)) / denom;
+        frac = safe_min(frac, Real(1.0));
+        Real release = reach.lake_q_min
+                     + (reach.lake_q_ref - reach.lake_q_min) * safe_pow_real(frac, reach.lake_exp);
+        Real spill = reach.lake_spill_coef * safe_max(Real(S - Smax), Real(0.0)) / Real(sub_dt);
+        Real Q = safe_max(Real(release + spill), Real(0.0));
+        // mass safety: cannot release more than available active storage + inflow
+        Real Q_avail = safe_max(Real(S - Sdead), Real(0.0)) / Real(sub_dt) + I;
+        Q = safe_min(Q, safe_max(Q_avail, Real(0.0)));
+        // explicit storage update
+        S = safe_max(Real(S + Real(sub_dt) * (I - Q)), Real(0.0));
+        Qsum = Qsum + Q;
+    }
+    reach.storage = S;
+    return Qsum / Real(nsub);
+}
+
+inline Real MuskingumCungeRouter::apply_subgrid_lake(Reach& reach, double dt) {
+    // Split lateral inflow: a fraction `subgrid_lake_frac` is routed through an
+    // aggregate subgrid lake store (storage-discharge), the remainder is direct.
+    // Returns the effective lateral inflow to the channel. q_ref/exp are learnable.
+    const int nsub = (config_.num_substeps > 1) ? config_.num_substeps : 4;
+    const double sub_dt = dt / nsub;
+    const Real Lat = reach.lateral_inflow;
+    const Real to_lake = Real(reach.subgrid_lake_frac) * Lat;
+    const Real direct = Lat - to_lake;
+    const Real Smax = Real(reach.subgrid_storage_max > 0.0 ? reach.subgrid_storage_max : 1.0);
+
+    Real S = reach.subgrid_storage;
+    Real Qsum = Real(0.0);
+    for (int k = 0; k < nsub; ++k) {
+        Real frac = safe_min(Real(safe_max(S, Real(0.0)) / Smax), Real(1.0));
+        Real Q = reach.subgrid_q_ref * safe_pow_real(frac, reach.subgrid_exp);
+        Real Q_avail = Real(safe_max(S, Real(0.0)) / Real(sub_dt)) + to_lake;
+        Q = safe_min(safe_max(Q, Real(0.0)), safe_max(Q_avail, Real(0.0)));
+        S = safe_max(Real(S + Real(sub_dt) * (to_lake - Q)), Real(0.0));
+        Qsum = Qsum + Q;
+    }
+    reach.subgrid_storage = S;
+    return direct + Qsum / Real(nsub);
 }
 
 inline void MuskingumCungeRouter::route_timestep() {
@@ -602,16 +681,25 @@ inline void MuskingumCungeRouter::route_timestep() {
         
         // Update inflow from upstream
         reach.inflow_curr = compute_reach_inflow(reach);
-        
-        // Route through reach
-        reach.outflow_curr = route_reach(reach, config_.dt);
+
+        if (reach.is_lake) {
+            reach.outflow_curr = route_lake(reach, config_.dt);
+        } else {
+            // optional subgrid (off-network) lake attenuation of local runoff
+            if (reach.has_subgrid_lake) {
+                reach.lateral_inflow = apply_subgrid_lake(reach, config_.dt);
+            }
+            reach.outflow_curr = route_reach(reach, config_.dt);
+        }
     }
-    
+
     // Advance state: current becomes previous
     for (int reach_id : network_.topological_order()) {
         Reach& reach = network_.get_reach(reach_id);
         reach.inflow_prev = reach.inflow_curr;
         reach.outflow_prev = reach.outflow_curr;
+        reach.storage_prev = reach.storage;
+        reach.subgrid_storage_prev = reach.subgrid_storage;
     }
     
     current_time_ += config_.dt;
@@ -797,14 +885,25 @@ inline std::unordered_map<std::string, double> MuskingumCungeRouter::get_gradien
     for (int reach_id : network_.topological_order()) {
         const Reach& reach = network_.get_reach(reach_id);
         std::string prefix = "reach_" + std::to_string(reach_id) + "_";
-        
-        grads[prefix + "manning_n"] = reach.grad_manning_n;
-        grads[prefix + "width_coef"] = reach.grad_width_coef;
-        grads[prefix + "width_exp"] = reach.grad_width_exp;
-        grads[prefix + "depth_coef"] = reach.grad_depth_coef;
-        grads[prefix + "depth_exp"] = reach.grad_depth_exp;
+
+        if (reach.is_lake) {
+            grads[prefix + "lake_q_ref"] = reach.grad_lake_q_ref;
+            grads[prefix + "lake_exp"] = reach.grad_lake_exp;
+            grads[prefix + "lake_q_min"] = reach.grad_lake_q_min;
+            grads[prefix + "lake_spill_coef"] = reach.grad_lake_spill_coef;
+        } else {
+            grads[prefix + "manning_n"] = reach.grad_manning_n;
+            grads[prefix + "width_coef"] = reach.grad_width_coef;
+            grads[prefix + "width_exp"] = reach.grad_width_exp;
+            grads[prefix + "depth_coef"] = reach.grad_depth_coef;
+            grads[prefix + "depth_exp"] = reach.grad_depth_exp;
+            if (reach.has_subgrid_lake) {
+                grads[prefix + "subgrid_q_ref"] = reach.grad_subgrid_q_ref;
+                grads[prefix + "subgrid_exp"] = reach.grad_subgrid_exp;
+            }
+        }
     }
-    
+
     return grads;
 }
 

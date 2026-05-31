@@ -467,6 +467,10 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         topo_order = net.topological_order()
         self.logger.info(f"dRoute C++ network built: {net.num_reaches()} reaches, {net.num_junctions()} junctions")
 
+        # Apply lake/reservoir config (settings/dRoute/droute_lakes.yaml) onto the
+        # built network before the router is constructed. No-op if absent.
+        self._apply_lakes(net, network)
+
         # Configure router
         config = droute.RouterConfig()
         config.dt = float(dt)
@@ -483,6 +487,35 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
             routed_flow[t, :] = router.get_all_discharges()
 
         return routed_flow
+
+    def _apply_lakes(self, net, network: Dict[str, Any]) -> int:
+        """Apply settings/dRoute/droute_lakes.yaml onto the built C++ network.
+
+        Maps river-network segId -> reach index (reach.id == index) and sets the
+        inline-lake / subgrid-lake fields so route_timestep() routes lakes as
+        storage-discharge reservoirs. Returns reaches modified (0 if no config).
+        """
+        try:
+            settings_path = self.get_config_path('SETTINGS_DROUTE_PATH', 'settings/dRoute/')
+            lake_yaml = settings_path / 'droute_lakes.yaml'
+            if not lake_yaml.exists():
+                return 0
+            import yaml
+            from droute.lake_preprocessor import apply_lake_config_to_network
+            with open(lake_yaml, 'r', encoding='utf-8') as f:
+                raw = yaml.safe_load(f) or {}
+            classification = {'inline': raw.get('inline_lakes', {}) or {},
+                              'subgrid': raw.get('subgrid_lakes', {}) or {}}
+            seg_ids = network['segment_ids']
+            segid_to_index = {int(s): i for i, s in enumerate(seg_ids)}
+            n = apply_lake_config_to_network(net, classification, segid_to_index, logger=self.logger)
+            self.logger.info(
+                f"dRoute lakes applied: {n} reaches "
+                f"({len(classification['inline'])} inline, {len(classification['subgrid'])} subgrid)")
+            return n
+        except Exception as e:  # noqa: BLE001 - lakes optional, never block routing
+            self.logger.warning(f"Lake config not applied: {type(e).__name__}: {e}")
+            return 0
 
     def _route_numpy_fallback(
         self,

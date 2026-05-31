@@ -109,9 +109,46 @@ class DRoutePreProcessor(BaseModelPreProcessor, GeospatialUtilsMixin, DRouteConf
 
         self.copy_base_settings()
         self.setup_topology()
+        self.setup_lakes()
         self.create_config_file()
 
         self.logger.info("dRoute spatial preprocessing completed")
+
+    def setup_lakes(self):
+        """Classify HydroLAKES into inline/subgrid lakes for the dRoute network.
+
+        No-op unless a HydroLAKES layer is present
+        (data/attributes/lakes/domain_<name>_hydrolakes.gpkg) or DROUTE_USE_LAKES is set.
+        Writes settings/dRoute/droute_lakes.yaml; the network adapter applies it when
+        building the dRoute network.
+        """
+        try:
+            use_lakes = self._get_config_value(
+                lambda: self.config.model.droute.use_lakes, default=True,
+                dict_key='DROUTE_USE_LAKES')
+            if not use_lakes:
+                return
+            lakes_gpkg = next(iter(sorted(
+                (self.project_dir / 'data' / 'attributes' / 'lakes').glob('*hydrolakes*.gpkg'))), None)
+            if lakes_gpkg is None:
+                self.logger.debug("No HydroLAKES layer found; skipping lake setup")
+                return
+            rn = next(iter(sorted((self.project_dir / 'shapefiles' / 'river_network').glob('*.shp'))), None)
+            rb_dir = self.project_dir / 'shapefiles' / 'river_basins'
+            rb = next(iter(sorted(rb_dir.glob('*.shp'))), None) if rb_dir.exists() else None
+            if rn is None:
+                self.logger.warning("No river-network shapefile for lake classification; skipping")
+                return
+            from droute.lake_preprocessor import classify_lakes, write_lake_config
+            segfield = self._get_config_value(
+                lambda: self.config.model.droute.river_network_segid, default='LINKNO',
+                dict_key='RIVER_NETWORK_SHP_SEGID')
+            cls = classify_lakes(lakes_gpkg, rn, rb, segid_field=segfield, logger=self.logger)
+            self.lake_config_path = write_lake_config(
+                cls, self.setup_dir / 'droute_lakes.yaml', logger=self.logger)
+            self.lake_classification = cls
+        except Exception as e:  # noqa: BLE001 - lakes are optional, never block preprocessing
+            self.logger.warning(f"Lake setup skipped due to: {type(e).__name__}: {e}")
 
     def copy_base_settings(self, source_dir: Optional[Path] = None, file_patterns: Optional[list] = None):
         """

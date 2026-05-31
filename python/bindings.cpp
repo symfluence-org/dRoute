@@ -371,7 +371,67 @@ static double routing_objective(
              "Gradient w.r.t. depth coefficient")
          .def_property_readonly("grad_depth_exp",
              [](const Reach& r) { return r.grad_depth_exp; },
-             "Gradient w.r.t. depth exponent");
+             "Gradient w.r.t. depth exponent")
+
+         // ===== Lake / reservoir =====
+         .def_readwrite("is_lake", &Reach::is_lake,
+             "Route this reach as a lake/reservoir (storage-discharge) instead of channel")
+         .def_readwrite("lake_type", &Reach::lake_type, "0=natural lake, 1=reservoir")
+         .def_readwrite("lake_area", &Reach::lake_area, "Lake surface area [m^2]")
+         .def_readwrite("storage_max", &Reach::storage_max, "Maximum/full storage [m^3]")
+         .def_property("storage",
+             [](const Reach& r) { return to_double(r.storage); },
+             [](Reach& r, double v) { r.storage = Real(v); }, "Current storage [m^3]")
+         .def_property("lake_q_ref",
+             [](const Reach& r) { return to_double(r.lake_q_ref); },
+             [](Reach& r, double v) { r.lake_q_ref = Real(v); },
+             "Reference/target outflow [m^3/s] (learnable)")
+         .def_property("lake_exp",
+             [](const Reach& r) { return to_double(r.lake_exp); },
+             [](Reach& r, double v) { r.lake_exp = Real(v); }, "Rating exponent (learnable)")
+         .def_property("lake_q_min",
+             [](const Reach& r) { return to_double(r.lake_q_min); },
+             [](Reach& r, double v) { r.lake_q_min = Real(v); },
+             "Minimum/regulated release [m^3/s] (learnable)")
+         .def_property("lake_s_dead",
+             [](const Reach& r) { return to_double(r.lake_s_dead); },
+             [](Reach& r, double v) { r.lake_s_dead = Real(v); }, "Dead storage [m^3]")
+         .def_property("lake_spill_coef",
+             [](const Reach& r) { return to_double(r.lake_spill_coef); },
+             [](Reach& r, double v) { r.lake_spill_coef = Real(v); },
+             "Above-full spill fraction per step (learnable)")
+         .def_property_readonly("grad_lake_q_ref",
+             [](const Reach& r) { return r.grad_lake_q_ref; }, "Gradient w.r.t. lake_q_ref")
+         .def_property_readonly("grad_lake_exp",
+             [](const Reach& r) { return r.grad_lake_exp; }, "Gradient w.r.t. lake_exp")
+         .def_property_readonly("grad_lake_q_min",
+             [](const Reach& r) { return r.grad_lake_q_min; }, "Gradient w.r.t. lake_q_min")
+         .def_property_readonly("grad_lake_spill_coef",
+             [](const Reach& r) { return r.grad_lake_spill_coef; },
+             "Gradient w.r.t. lake_spill_coef")
+
+         // ===== Subgrid (off-network) lake store =====
+         .def_readwrite("has_subgrid_lake", &Reach::has_subgrid_lake,
+             "Attenuate a fraction of lateral inflow through aggregated subgrid lakes")
+         .def_readwrite("subgrid_lake_frac", &Reach::subgrid_lake_frac,
+             "Fraction of lateral inflow routed through subgrid lakes [0,1]")
+         .def_readwrite("subgrid_storage_max", &Reach::subgrid_storage_max,
+             "Max storage of the aggregate subgrid store [m^3]")
+         .def_property("subgrid_storage",
+             [](const Reach& r) { return to_double(r.subgrid_storage); },
+             [](Reach& r, double v) { r.subgrid_storage = Real(v); }, "Subgrid store storage [m^3]")
+         .def_property("subgrid_q_ref",
+             [](const Reach& r) { return to_double(r.subgrid_q_ref); },
+             [](Reach& r, double v) { r.subgrid_q_ref = Real(v); },
+             "Subgrid store reference outflow [m^3/s] (learnable)")
+         .def_property("subgrid_exp",
+             [](const Reach& r) { return to_double(r.subgrid_exp); },
+             [](Reach& r, double v) { r.subgrid_exp = Real(v); },
+             "Subgrid store rating exponent (learnable)")
+         .def_property_readonly("grad_subgrid_q_ref",
+             [](const Reach& r) { return r.grad_subgrid_q_ref; }, "Gradient w.r.t. subgrid_q_ref")
+         .def_property_readonly("grad_subgrid_exp",
+             [](const Reach& r) { return r.grad_subgrid_exp; }, "Gradient w.r.t. subgrid_exp");
  
      // =========================================================================
      // Junction
