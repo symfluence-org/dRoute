@@ -69,3 +69,6 @@ docs/_build/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Experiment outputs
+experiments/results*/
