@@ -478,13 +478,17 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
 
         router = droute.MuskingumCungeRouter(net, config)
 
-        # Route timestep-by-timestep
+        # Route timestep-by-timestep.
+        # NOTE: get_all_discharges() returns values ordered by the network's
+        # topological_order(), NOT by reach/segment index. Scatter them back to
+        # segment-index columns via topo_order so routed_flow[:, i] is segment i.
+        topo_arr = np.asarray(topo_order, dtype=int)
         routed_flow = np.zeros((n_time, n_segments))
         for t in range(n_time):
             for idx in topo_order:
                 router.set_lateral_inflow(idx, float(segment_runoff[t, idx]))
             router.route_timestep()
-            routed_flow[t, :] = router.get_all_discharges()
+            routed_flow[t, topo_arr] = router.get_all_discharges()
 
         return routed_flow
 
