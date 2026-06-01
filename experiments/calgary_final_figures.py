@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.colors import LightSource
+from matplotlib.colors import LightSource, ListedColormap
 import geopandas as gpd
 import rasterio
 from rasterio.mask import mask as rio_mask
@@ -66,8 +66,11 @@ def make_map():
     ls = LightSource(azdeg=315, altdeg=45)
     shaded = ls.hillshade(np.nan_to_num(dem, nan=np.nanmin(dem)), vert_exag=0.0008, dx=90, dy=90)
     shaded[~np.isfinite(dem)] = np.nan
-    terr = plt.cm.terrain.copy(); terr.set_bad(alpha=0); gray = plt.cm.gray.copy(); gray.set_bad(alpha=0)
-    ax.imshow(dem, extent=ext, cmap=terr, origin="upper",
+    # truncate `terrain` to skip its bottom ~25% (the blue "below-sea-level" band) so the
+    # low-elevation dry lowlands render green/tan, not as water. Hypsometric land tint.
+    land = ListedColormap(plt.cm.terrain(np.linspace(0.25, 1.0, 256)))
+    land.set_bad(alpha=0); gray = plt.cm.gray.copy(); gray.set_bad(alpha=0)
+    ax.imshow(dem, extent=ext, cmap=land, origin="upper",
               vmin=np.nanpercentile(dem, 2), vmax=np.nanpercentile(dem, 98), zorder=1)
     ax.imshow(shaded, extent=ext, cmap=gray, alpha=0.35, origin="upper", zorder=2)
     wshd.boundary.plot(ax=ax, color="0.1", lw=1.4, zorder=8)
@@ -77,14 +80,18 @@ def make_map():
     lakes[lakes["inline"] & ~lakes["is_res"]].plot(ax=ax, facecolor="#2e86d6", edgecolor="white", lw=0.6, zorder=6)
     lakes[lakes["inline"] & lakes["is_res"]].plot(ax=ax, facecolor="#d63a2e", edgecolor="white", lw=0.7, zorder=7)
 
+    east_edge = bnds[2]
     for sid, (name, lat, lon) in GAUGES.items():
         ax.plot(lon, lat, marker="*", ms=18, mfc="#ffd400", mec="black", mew=1.0, zorder=10)
-        ax.annotate(f"{name}\n{sid}", (lon, lat), xytext=(6, 6), textcoords="offset points",
-                    fontsize=8, weight="bold", zorder=11,
+        # label to the left for gauges near the east edge (avoid clipping), else to the right
+        left = lon > east_edge - 0.25
+        ax.annotate(f"{name}\n{sid}", (lon, lat),
+                    xytext=(-6 if left else 6, 6), textcoords="offset points",
+                    ha="right" if left else "left", fontsize=8, weight="bold", zorder=11,
                     bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="0.5", alpha=0.85))
     ax.set_xlim(bnds[0] - pad, bnds[2] + pad); ax.set_ylim(bnds[1] - pad, bnds[3] + pad)
     ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
-    sm = plt.cm.ScalarMappable(cmap="terrain",
+    sm = plt.cm.ScalarMappable(cmap=land,
             norm=plt.Normalize(np.nanpercentile(dem, 2), np.nanpercentile(dem, 98)))
     fig.colorbar(sm, ax=ax, shrink=0.55, label="Elevation (m)")
     handles = [
