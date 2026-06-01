@@ -7,8 +7,10 @@ those four parameters PER RESERVOIR (5 reservoirs -> 20 parameters) with Adam, u
 exact reverse-mode (CoDiPack) gradients -- the capability the library exists to demonstrate.
 
 Routing is done at a DAILY timestep (hourly SUMMA runoff aggregated to daily) to keep the AD
-tape light over the multi-year calibration window. Loss is MSE on daily routed discharge at the
-Calgary outlet vs WSC observations; calibration KGE is tracked and the best parameter set kept.
+tape light over the multi-year calibration window. The loss is (1 - KGE) at the Calgary outlet
+vs WSC observations, with the analytical dKGE/dQ gradient (verified against finite differences,
+cos = 1.0) seeding dRoute's reverse pass -- i.e. Adam optimises the actual calibration objective,
+not an MSE surrogate. The best calibration KGE is kept.
 
 Run AFTER the SUMMA hydrology calibration so the routed volumes are unbiased; works on the
 current runoff too (machinery test).
@@ -159,7 +161,33 @@ def kge(sim, obs):
     return 1 - np.sqrt((r - 1) ** 2 + (s.std() / o.std() - 1) ** 2 + (s.mean() / o.mean() - 1) ** 2)
 
 
-def main(epochs=60, lr=0.08, seed=0, runoff_path=None):
+def dloss_dsim(sim, obs):
+    """Analytical gradient of the loss (1 - KGE) w.r.t. each daily routed discharge.
+
+    Returns a full-length vector (0 where obs is missing) to seed dRoute's reverse
+    pass directly on the actual calibration objective (KGE), not an MSE surrogate.
+    Verified against central finite differences (cos = 1.0). Population statistics.
+    """
+    g = np.zeros_like(sim, dtype=float)
+    m = np.isfinite(sim) & np.isfinite(obs)
+    s = sim[m].astype(float); o = obs[m].astype(float); N = len(s)
+    if N < 10 or s.std() == 0 or o.std() == 0:
+        return g
+    sb, ob, sig_s, sig_o = s.mean(), o.mean(), s.std(), o.std()
+    Ss = np.sum((s - sb) ** 2); So = np.sum((o - ob) ** 2)
+    r = np.sum((s - sb) * (o - ob)) / np.sqrt(Ss * So)
+    alpha, beta = sig_s / sig_o, sb / ob
+    ED = (r - 1) ** 2 + (alpha - 1) ** 2 + (beta - 1) ** 2
+    sED = np.sqrt(ED) if ED > 0 else 1e-12
+    dr = (o - ob) / np.sqrt(Ss * So) - r * (s - sb) / Ss
+    dalpha = (s - sb) / (N * sig_s * sig_o)
+    dbeta = (1.0 / N) / ob
+    dED = 2 * (r - 1) * dr + 2 * (alpha - 1) * dalpha + 2 * (beta - 1) * dbeta
+    g[m] = dED / (2 * sED)            # d(1 - KGE)/d sim_t
+    return g
+
+
+def main(epochs=60, lr=0.015, seed=0, runoff_path=None):
     inp = load_inputs(runoff_path)
     net = build_network(inp["seg_ids"], inp["downstream_idx"], inp["lengths"], inp["slopes"])
     res_idx = apply_lakes_and_get_reservoirs(net, inp["id_to_idx"])
@@ -196,8 +224,7 @@ def main(epochs=60, lr=0.08, seed=0, runoff_path=None):
     for ep in range(1, epochs + 1):
         set_reservoir_params(net, res_idx, U)
         Q, rt = route_daily(net, runoff, outlet, record=True)
-        resid = np.where(np.isfinite(obs), Q - obs, 0.0)
-        dL_dQ = (2.0 / N) * resid                      # d MSE / d Q_t at outlet
+        dL_dQ = dloss_dsim(Q, obs)                     # d(1 - KGE) / d Q_t at outlet
         rt.compute_gradients_timeseries(outlet, dL_dQ.tolist())
         # Adam step in unit space (chain rule: dL/du = dL/dparam * dparam/du)
         for ri in res_idx:
@@ -233,7 +260,7 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--epochs", type=int, default=60)
-    ap.add_argument("--lr", type=float, default=0.02)
+    ap.add_argument("--lr", type=float, default=0.015)
     ap.add_argument("--runoff", default=None, help="SUMMA runoff netCDF (default: current uncalibrated)")
     a = ap.parse_args()
     main(epochs=a.epochs, lr=a.lr, runoff_path=a.runoff)

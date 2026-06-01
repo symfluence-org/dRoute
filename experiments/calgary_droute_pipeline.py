@@ -61,7 +61,7 @@ def main():
     ap.add_argument("--runoff", default=None, help="SUMMA runoff netCDF (default: current uncalibrated)")
     ap.add_argument("--label", default="baseline", help="tag for output files")
     ap.add_argument("--epochs", type=int, default=60)
-    ap.add_argument("--lr", type=float, default=0.01)
+    ap.add_argument("--lr", type=float, default=0.015)
     a = ap.parse_args()
 
     import os

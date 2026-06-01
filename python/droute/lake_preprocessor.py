@@ -32,6 +32,7 @@ def classify_lakes(
     river_network_path: Path,
     river_basins_path: Optional[Path] = None,
     segid_field: str = "LINKNO",
+    min_inline_frac: float = 0.30,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """Classify HydroLAKES into inline (on-network) and subgrid (off-network) lakes.
@@ -58,13 +59,18 @@ def classify_lakes(
             return default
 
     inline: Dict[int, Dict[str, Any]] = {}
-    subgrid_lakes = []  # lakes not on the network (assigned to catchments below)
+    subgrid_lakes = []  # lakes not genuinely on the network (assigned to catchments below)
 
-    # spatial join lakes -> river segments they intersect
-    joined = gpd.sjoin(lakes, rivers[[segid_field, "geometry"]], predicate="intersects", how="left")
+    # A lake is INLINE only if a reach genuinely flows THROUGH it: the river line must
+    # be substantially contained in the lake polygon. We assign each lake to the reach
+    # with the greatest reach-length-inside-lake (NOT max drainage area, which would grab
+    # a mainstem reach the lake merely clips near a confluence), and require that the
+    # overlap covers at least ``min_inline_frac`` of the reach. Lakes that only marginally
+    # touch the network fall through to the subgrid (off-network) store.
+    rivers_idx = rivers.reset_index(drop=True)
+    sidx = rivers_idx.sindex
     for idx, lk in lakes.iterrows():
-        hits = joined[joined.index == idx]
-        seg_hits = hits[~hits[segid_field].isna()] if segid_field in hits else hits.iloc[0:0]
+        geom = lk.geometry
         area_m2 = attr(lk, "Lake_area") * KM2_TO_M2
         vol_m3 = attr(lk, "Vol_total") * MCM_TO_M3
         depth = attr(lk, "Depth_avg")
@@ -72,21 +78,31 @@ def classify_lakes(
             vol_m3 = area_m2 * depth
         dis = attr(lk, "Dis_avg")
         ltype = int(attr(lk, "Lake_type", 1))         # 1=lake, 2=reservoir, 3=lake control
-        droute_type = 0 if ltype == 1 else 1            # 0=natural, 1=reservoir
-        if len(seg_hits) > 0:
-            # inline: assign to the most-downstream intersected segment (max drainage area)
-            if "DSContArea" in seg_hits:
-                seg = int(seg_hits.sort_values("DSContArea", ascending=False).iloc[0][segid_field])
-            else:
-                seg = int(seg_hits.iloc[0][segid_field])
-            cur = inline.get(seg)
+        droute_type = 0 if ltype == 1 else 1            # 0=natural, 1=reservoir/regulated
+
+        # candidate reaches whose bbox intersects the lake
+        cand = list(sidx.query(geom, predicate="intersects")) if geom is not None else []
+        best_seg, best_overlap, best_frac = None, 0.0, 0.0
+        for ci in cand:
+            reach = rivers_idx.geometry.iloc[ci]
+            if reach is None or reach.length <= 0:
+                continue
+            ov = reach.intersection(geom).length
+            if ov > best_overlap:
+                best_overlap = ov
+                best_frac = ov / reach.length
+                best_seg = int(rivers_idx.iloc[ci][segid_field])
+
+        if best_seg is not None and best_frac >= min_inline_frac:
             rec = {"lake_type": droute_type, "lake_area": area_m2, "storage_max": vol_m3,
-                   "lake_q_ref": dis if dis > 0 else None, "hylak_id": int(attr(lk, "Hylak_id"))}
-            # if several lakes hit one segment, keep the largest
+                   "lake_q_ref": dis if dis > 0 else None, "hylak_id": int(attr(lk, "Hylak_id")),
+                   "overlap_frac": round(best_frac, 3)}
+            cur = inline.get(best_seg)
+            # if several lakes flow through one reach, keep the largest
             if cur is None or vol_m3 > cur.get("storage_max", 0):
-                inline[seg] = rec
+                inline[best_seg] = rec
         else:
-            subgrid_lakes.append({"geometry": lk.geometry, "area_m2": area_m2,
+            subgrid_lakes.append({"geometry": geom, "area_m2": area_m2,
                                   "vol_m3": vol_m3, "dis": dis})
 
     subgrid: Dict[int, Dict[str, Any]] = {}
