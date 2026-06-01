@@ -53,7 +53,8 @@ def build_network(seg_ids, downstream_idx, lengths, slopes, mannings_n=0.035):
     return net
 
 
-def load_inputs():
+def load_inputs(runoff_path=None):
+    runoff_path = runoff_path or f"{D}/simulations/bow_calgary_v1/SUMMA/bow_calgary_v1_timestep.nc"
     rn = gpd.read_file(glob.glob(f"{D}/shapefiles/river_network/*.shp")[0])
     seg_ids = rn["LINKNO"].astype(int).values
     id_to_idx = {int(s): i for i, s in enumerate(seg_ids)}
@@ -62,7 +63,7 @@ def load_inputs():
     slopes = rn["Slope"].astype(float).values
     outlet_idx = int(np.argmax(rn["DSContArea"].astype(float).values))
 
-    ds = xr.open_dataset(f"{D}/simulations/bow_calgary_v1/SUMMA/bow_calgary_v1_timestep.nc")
+    ds = xr.open_dataset(runoff_path)
     runoff = ds["averageRoutedRunoff"].values
     gru = ds["gruId"].values.astype(int)
     time = pd.to_datetime(ds["time"].values)
@@ -158,8 +159,8 @@ def kge(sim, obs):
     return 1 - np.sqrt((r - 1) ** 2 + (s.std() / o.std() - 1) ** 2 + (s.mean() / o.mean() - 1) ** 2)
 
 
-def main(epochs=60, lr=0.08, seed=0):
-    inp = load_inputs()
+def main(epochs=60, lr=0.08, seed=0, runoff_path=None):
+    inp = load_inputs(runoff_path)
     net = build_network(inp["seg_ids"], inp["downstream_idx"], inp["lengths"], inp["slopes"])
     res_idx = apply_lakes_and_get_reservoirs(net, inp["id_to_idx"])
     print(f"{len(res_idx)} reservoirs at reaches {res_idx} -> {4*len(res_idx)} operating-rule params")
@@ -225,7 +226,7 @@ def main(epochs=60, lr=0.08, seed=0):
               f"exp={from_unit('exp',best['U'][ri]['exp']):.2f} "
               f"q_min={from_unit('q_min',best['U'][ri]['q_min']):.2f} "
               f"spill={from_unit('spill',best['U'][ri]['spill']):.2f}")
-    return kge0, best
+    return kge0, best, res_idx, inp
 
 
 if __name__ == "__main__":
@@ -233,5 +234,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--lr", type=float, default=0.02)
+    ap.add_argument("--runoff", default=None, help="SUMMA runoff netCDF (default: current uncalibrated)")
     a = ap.parse_args()
-    main(epochs=a.epochs, lr=a.lr)
+    main(epochs=a.epochs, lr=a.lr, runoff_path=a.runoff)
