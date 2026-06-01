@@ -186,6 +186,19 @@ def run(runoff_path, epochs=80, lr=0.02):
 
     # ---- final per-gauge report (baseline vs default-lakes vs joint-calibrated) ----
     Qc = route(build_apply(best["U"]), False)[0]
+    # save routed series at the gauges for figure generation (no recalibration needed)
+    import os
+    os.makedirs(RES, exist_ok=True)
+    np.savez(f"{RES}/joint_calib.npz",
+             dates=np.asarray(dates, dtype="datetime64[ns]"),
+             gauge_labels=np.array([g[0] for g in gauges]),
+             gauge_stations=np.array([g[1] for g in gauges]),
+             gauge_segs=np.array([g[2] for g in gauges]),
+             q_base=np.column_stack([Qb[:, gi] for _, _, _, gi in gauges]),
+             q_lake_def=np.column_stack([Qd[:, gi] for _, _, _, gi in gauges]),
+             q_lake_cal=np.column_stack([Qc[:, gi] for _, _, _, gi in gauges]),
+             obs=np.column_stack([obs[gi] for _, _, _, gi in gauges]),
+             kge_base=kge_base, kge_def=kge0, kge_cal=best["kge"])
     print(f"\nmean KGE -- baseline(no lakes) {kge_base:.3f} | lakes(default) {kge0:.3f} | "
           f"lakes(joint-calibrated) {best['kge']:.3f} (ep {best['epoch']})")
     print(f"\n{'gauge':18} {'baseline':>9} {'lakes_def':>9} {'lakes_cal':>9}")
