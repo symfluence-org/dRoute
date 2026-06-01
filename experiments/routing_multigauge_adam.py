@@ -25,7 +25,7 @@ import yaml
 import droute
 
 from reservoir_rules_adam import (
-    D, OBS, RES, DT_DAY, CAL, build_network, load_inputs, kge, dloss_dsim,
+    D, OBS, RES, DT_DAY, CAL, build_network, load_inputs, kge, dloss_dsim, mask_spinup,
     BOUNDS as LAKE_BOUNDS,
 )
 
@@ -73,7 +73,7 @@ def run(runoff_path, epochs=80, lr=0.02):
     obs = {}
     for lab, sid, seg, gi in gauges:
         o = pd.read_csv(f"{OBS}/wsc_{sid}_daily.csv", parse_dates=["date"]).set_index("date")["q_cms"]
-        obs[gi] = o.reindex(dates).values
+        obs[gi] = mask_spinup(o.reindex(dates).values, dates)   # exclude spin-up year
 
     # ---- build parameter vector (unit space) ----
     # each entry: (kind, key, name, lo, hi, tr); value lives in U[]

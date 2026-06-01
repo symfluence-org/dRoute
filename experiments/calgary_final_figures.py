@@ -114,6 +114,9 @@ def make_hydrographs():
     z = np.load(f"{RES}/joint_calib.npz", allow_pickle=True)
     dates = pd.to_datetime(z["dates"]); labels = z["gauge_labels"]; stations = z["gauge_stations"]
     qb, qc, obs = z["q_base"], z["q_lake_cal"], z["obs"]
+    # plot only the evaluation window (exclude the routing spin-up year)
+    ev = dates >= pd.Timestamp("2011-01-01")
+    dates, qb, qc, obs = dates[ev], qb[ev], qc[ev], obs[ev]
 
     def kge(s, o):
         m = np.isfinite(s) & np.isfinite(o); s, o = s[m], o[m]
