@@ -1,0 +1,204 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Joint multi-gauge routing calibration on Bow at Calgary via dRoute AD gradients.
+
+Calibrates ALL routing degrees of freedom together against the multi-gauge objective,
+to stop the lake routing from over-attenuating the (well-calibrated) upstream gauges:
+
+  * per-reach Manning's n                         (107 params)
+  * every inline lake/reservoir rating            (q_ref/exp/q_min/spill_coef)
+  * every subgrid lake store rating               (subgrid_q_ref/subgrid_exp)
+
+Loss = mean over the 5 nested Bow gauges of (1 - KGE_gauge); the analytical dKGE/dQ at
+each gauge seeds a single reverse pass via compute_gradients_timeseries(reach_ids, ...).
+Adam optimises all parameters jointly from dRoute's exact gradients. Daily timestep
+(light AD tape over the multi-year window). Run on the SUMMA-calibrated runoff.
+
+This is the high-dimensional gradient calibration the library exists to make cheap:
+~200 parameters, one forward + one reverse pass per epoch.
+"""
+import argparse
+import glob
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import yaml
+import droute
+
+from reservoir_rules_adam import (
+    D, OBS, RES, DT_DAY, CAL, build_network, load_inputs, kge, dloss_dsim,
+    BOUNDS as LAKE_BOUNDS,
+)
+
+NESTED = [("Lake Louise", "05BA001", 291), ("Banff", "05BB001", 270),
+          ("Seebe", "05BE004", 199), ("Cochrane", "05BH005", 390),
+          ("Calgary (outlet)", "05BH004", 402)]
+
+MANNING_BND = (0.02, 0.12, "log")
+SUBGRID_BND = {"sq_ref": (0.05, 1000.0, "log"), "sexp": (1.0, 3.0, "lin")}
+
+
+def _unit(lo, hi, tr, v):
+    if tr == "log":
+        return (np.log(max(v, lo)) - np.log(lo)) / (np.log(hi) - np.log(lo))
+    return (v - lo) / (hi - lo)
+
+
+def _phys(lo, hi, tr, u):
+    u = min(max(u, 0.0), 1.0)
+    if tr == "log":
+        return float(np.exp(np.log(lo) + u * (np.log(hi) - np.log(lo))))
+    return float(lo + u * (hi - lo))
+
+
+def _dphys_du(lo, hi, tr, u):
+    if tr == "log":
+        return _phys(lo, hi, tr, u) * (np.log(hi) - np.log(lo))
+    return hi - lo
+
+
+def run(runoff_path, epochs=80, lr=0.02):
+    from droute.lake_preprocessor import apply_lake_config_to_network
+    inp = load_inputs(runoff_path)
+    seg_ids = inp["seg_ids"]; id_to_idx = inp["id_to_idx"]
+    runoff = inp["daily_runoff"]; dates = inp["dates"]; n_seg = len(seg_ids)
+
+    with open(f"{D}/settings/dRoute/droute_lakes.yaml", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    cls = {"inline": raw.get("inline_lakes", {}) or {}, "subgrid": raw.get("subgrid_lakes", {}) or {}}
+    inline_segs = [int(s) for s in cls["inline"] if int(s) in id_to_idx]
+    subgrid_segs = [int(s) for s in cls["subgrid"] if int(s) in id_to_idx]
+
+    gauges = [(lab, sid, seg, id_to_idx[seg]) for lab, sid, seg in NESTED if seg in id_to_idx]
+    gauge_idx = [g[3] for g in gauges]
+    obs = {}
+    for lab, sid, seg, gi in gauges:
+        o = pd.read_csv(f"{OBS}/wsc_{sid}_daily.csv", parse_dates=["date"]).set_index("date")["q_cms"]
+        obs[gi] = o.reindex(dates).values
+
+    # ---- build parameter vector (unit space) ----
+    # each entry: (kind, key, name, lo, hi, tr); value lives in U[]
+    specs = []
+    for i in range(n_seg):
+        specs.append(("manning", i, "manning", *MANNING_BND))
+    for seg in inline_segs:
+        for nm in ("q_ref", "exp", "q_min", "spill"):
+            specs.append(("lake", seg, nm, *LAKE_BOUNDS[nm]))
+    for seg in subgrid_segs:
+        specs.append(("subgrid", seg, "sq_ref", *SUBGRID_BND["sq_ref"]))
+        specs.append(("subgrid", seg, "sexp", *SUBGRID_BND["sexp"]))
+    P = len(specs)
+    print(f"network {n_seg} reaches | {len(inline_segs)} inline lakes | {len(subgrid_segs)} subgrid | "
+          f"{P} parameters | {len(gauges)} gauges")
+
+    def build_apply(U):
+        net = build_network(seg_ids, inp["downstream_idx"], inp["lengths"], inp["slopes"])
+        apply_lake_config_to_network(net, cls, id_to_idx)
+        for k, (kind, key, nm, lo, hi, tr) in enumerate(specs):
+            v = _phys(lo, hi, tr, U[k])
+            if kind == "manning":
+                net.get_reach(key).manning_n = v
+            elif kind == "lake":
+                r = net.get_reach(id_to_idx[key])
+                setattr(r, {"q_ref": "lake_q_ref", "exp": "lake_exp",
+                            "q_min": "lake_q_min", "spill": "lake_spill_coef"}[nm], v)
+            else:
+                r = net.get_reach(id_to_idx[key])
+                setattr(r, "subgrid_q_ref" if nm == "sq_ref" else "subgrid_exp", v)
+        return net
+
+    def route(net, record):
+        c = droute.RouterConfig(); c.dt = DT_DAY; c.enable_gradients = record
+        rt = droute.MuskingumCungeRouter(net, c)
+        order = np.asarray(net.topological_order(), dtype=int)
+        if record:
+            rt.reset_gradients(); rt.start_recording()
+        Q = np.zeros((len(runoff), n_seg))
+        for t in range(len(runoff)):
+            for idx in order:
+                rt.set_lateral_inflow(int(idx), float(runoff[t, idx]))
+            rt.route_timestep()
+            if record:
+                rt.record_outputs(gauge_idx)
+            Q[t, order] = rt.get_all_discharges()
+        if record:
+            rt.stop_recording()
+        return Q, rt
+
+    def mean_kge(Q):
+        return float(np.nanmean([kge(Q[:, gi], obs[gi]) for gi in gauge_idx]))
+
+    grad_attr = {"q_ref": "grad_lake_q_ref", "exp": "grad_lake_exp",
+                 "q_min": "grad_lake_q_min", "spill": "grad_lake_spill_coef",
+                 "sq_ref": "grad_subgrid_q_ref", "sexp": "grad_subgrid_exp"}
+
+    # ---- init U from HydroLAKES defaults / manning 0.035 ----
+    net0 = build_network(seg_ids, inp["downstream_idx"], inp["lengths"], inp["slopes"])
+    apply_lake_config_to_network(net0, cls, id_to_idx)
+    U = np.zeros(P)
+    for k, (kind, key, nm, lo, hi, tr) in enumerate(specs):
+        if kind == "manning":
+            v = float(net0.get_reach(key).manning_n) or 0.035
+        elif kind == "lake":
+            r = net0.get_reach(id_to_idx[key])
+            v = float(getattr(r, {"q_ref": "lake_q_ref", "exp": "lake_exp",
+                                   "q_min": "lake_q_min", "spill": "lake_spill_coef"}[nm]))
+            if nm == "exp" and v <= 0: v = 1.5
+            if nm == "spill" and v <= 0: v = 1.0
+        else:
+            r = net0.get_reach(id_to_idx[key])
+            v = float(getattr(r, "subgrid_q_ref" if nm == "sq_ref" else "subgrid_exp"))
+            if nm == "sq_ref" and v <= 0: v = 1.0
+            if nm == "sexp" and v <= 0: v = 1.0
+        U[k] = min(max(_unit(lo, hi, tr, v), 0.0), 1.0)
+
+    U_init = U.copy()   # default-lakes / HydroLAKES starting rules
+    # baseline (no lakes) and default-lakes KGE for reference
+    Qb = route(build_network(seg_ids, inp["downstream_idx"], inp["lengths"], inp["slopes"]), False)[0]
+    kge_base = mean_kge(Qb)
+    Qd = route(build_apply(U_init), False)[0]
+    kge0 = mean_kge(Qd)
+    print(f"baseline (no lakes) mean KGE = {kge_base:.4f}")
+    print(f"epoch  0: mean KGE = {kge0:.4f}  (lakes, default rules)")
+
+    m = np.zeros(P); v = np.zeros(P); b1, b2, eps = 0.9, 0.999, 1e-8
+    best = {"kge": kge0, "U": U.copy(), "epoch": 0}
+    G = len(gauge_idx)
+    for ep in range(1, epochs + 1):
+        net = build_apply(U)
+        Q, rt = route(net, record=True)
+        dL = [(dloss_dsim(Q[:, gi], obs[gi]) / G).tolist() for gi in gauge_idx]
+        rt.compute_gradients_timeseries(gauge_idx, dL)
+        # read grads, Adam step in unit space
+        g = np.zeros(P)
+        for k, (kind, key, nm, lo, hi, tr) in enumerate(specs):
+            r = net.get_reach(key if kind == "manning" else id_to_idx[key])
+            gp = float(getattr(r, "grad_manning_n" if kind == "manning" else grad_attr[nm]))
+            g[k] = gp * _dphys_du(lo, hi, tr, U[k])
+        m = b1 * m + (1 - b1) * g
+        v = b2 * v + (1 - b2) * g * g
+        mh = m / (1 - b1 ** ep); vh = v / (1 - b2 ** ep)
+        U = np.clip(U - lr * mh / (np.sqrt(vh) + eps), 0.0, 1.0)
+        ke = mean_kge(route(build_apply(U), False)[0])
+        if ke > best["kge"]:
+            best = {"kge": ke, "U": U.copy(), "epoch": ep}
+        if ep % 5 == 0 or ep == 1:
+            print(f"epoch {ep:2d}: mean KGE = {ke:.4f}  best = {best['kge']:.4f} (ep {best['epoch']})")
+
+    # ---- final per-gauge report (baseline vs default-lakes vs joint-calibrated) ----
+    Qc = route(build_apply(best["U"]), False)[0]
+    print(f"\nmean KGE -- baseline(no lakes) {kge_base:.3f} | lakes(default) {kge0:.3f} | "
+          f"lakes(joint-calibrated) {best['kge']:.3f} (ep {best['epoch']})")
+    print(f"\n{'gauge':18} {'baseline':>9} {'lakes_def':>9} {'lakes_cal':>9}")
+    for lab, sid, seg, gi in gauges:
+        print(f"{lab:18} {kge(Qb[:, gi], obs[gi]):>9.3f} {kge(Qd[:, gi], obs[gi]):>9.3f} "
+              f"{kge(Qc[:, gi], obs[gi]):>9.3f}")
+    return kge_base, kge0, best
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--runoff", default=None)
+    ap.add_argument("--epochs", type=int, default=80)
+    ap.add_argument("--lr", type=float, default=0.02)
+    a = ap.parse_args()
+    run(a.runoff, epochs=a.epochs, lr=a.lr)
