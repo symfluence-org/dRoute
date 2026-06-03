@@ -509,19 +509,32 @@ inline int SaintVenantEnzyme::adjoint_rhs_callback(sunrealtype t, N_Vector y,
         for (int j = 0; j < N; ++j) acc += J[i * N + j] * lambda[j];
         lambda_dot[i] = -acc;
     }
-    // Running-cost source: the discrete loss L = sum_k l_k(Q(t_k)) is folded into a
-    // continuous adjoint source g_y(t) = dL/dQ(t_k(t))/dt at the gauge, so the WHOLE backward
-    // solve is a single CVodeB with NO per-observation CVodeReInitB. The per-step reinit was
-    // restarting the BDF integrator at order 1 every step, compounding error and washing out
-    // the costate (multi-reach gradients collapsed to near-equal values). λ' = -Jᵀλ - g_y.
-    // Observation k applies over (t_{k-1}, t_k]; with t_k = record_t0_+(k+1)*dt that is
-    // k(t) = ceil((t-record_t0_)/dt)-1, clamped to [0, N-1].
+    // Running-cost source: the discrete loss L = sum_k l_k(Q(t_k)) is folded into a continuous
+    // adjoint source g_y(t) = dL/dQ at the gauge, so the WHOLE backward solve is a single CVodeB
+    // with NO per-observation CVodeReInitB (per-step reinit restarted BDF at order 1, washing out
+    // the costate). λ' = -Jᵀλ - g_y.
+    //
+    // The source is sampled at observation times t_k = record_t0_ + (k+1)*dt (dL_dQ_[k]) and is
+    // injected as a TIME-CONTINUOUS (piecewise-LINEAR) interpolant, NOT a piecewise-constant
+    // boxcar. The boxcar jumps at every t_k crashed the BDF step controller (error-test failure ->
+    // step-size collapse -> low-order restart at each dt), forcing ~87 substeps per output step
+    // and making the Calgary-scale backward solve ~30 h/gradient. Linear interpolation removes the
+    // jumps (C0 source) so the integrator can take large implicit steps through the stiff-but-
+    // smooth adjoint; the gradient is unchanged in the dense-observation limit (verified: gradcheck
+    // recovery still passes). At t_k, s := (t-record_t0_)/dt - 1 == k.
     if (!self->dL_dQ_.empty()) {
         const double dt = self->config_.dt;
-        int k = static_cast<int>(std::ceil((t - self->record_t0_) / dt)) - 1;
-        if (k < 0) k = 0;
-        if (k >= static_cast<int>(self->dL_dQ_.size())) k = static_cast<int>(self->dL_dQ_.size()) - 1;
-        lambda_dot[self->gauge_state_idx_] -= self->dL_dQ_[k] / dt;
+        const int M = static_cast<int>(self->dL_dQ_.size());
+        double s = (t - self->record_t0_) / dt - 1.0;
+        double src;
+        if (s <= 0.0) src = self->dL_dQ_[0];
+        else if (s >= M - 1) src = self->dL_dQ_[M - 1];
+        else {
+            int k0 = static_cast<int>(std::floor(s));
+            double frac = s - k0;
+            src = (1.0 - frac) * self->dL_dQ_[k0] + frac * self->dL_dQ_[k0 + 1];
+        }
+        lambda_dot[self->gauge_state_idx_] -= src / dt;
     }
     if (self->config_.verbose) {
         static int cnt = 0;
