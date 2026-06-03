@@ -157,7 +157,18 @@ private:
     std::vector<double> recorded_times_;
     std::vector<std::vector<double>> recorded_states_;  // [n_times][state_size]
     int gauge_state_idx_ = -1;  // Index of gauge reach outlet Q in state vector
-    
+
+    // Lateral-inflow forcing history, recorded per outer step during the forward pass.
+    // The CVODES adjoint reconstructs the forward solution by re-integrating the RHS from
+    // checkpoints, so the forcing MUST be a reproducible function of time t (not the mutable
+    // lateral_inflows_ member, which the caller overwrites each step). Without this, the
+    // reconstruction diverges and overflows CVODES' data store -> NULL deref in CVAdataStore.
+    std::vector<std::vector<double>> lateral_history_;  // [step][reach]
+    double record_t0_ = 0.0;                            // time at start of recording
+    std::vector<double> record_y0_;                     // packed state at start of recording
+    bool adjoint_initialized_ = false;                  // CVodeAdjInit called exactly once
+    std::vector<double> dL_dQ_;                          // per-observation dL/dQ(t_k) (running-cost source)
+
     // Gradients (accumulated during backward pass)
     std::vector<double> grad_manning_n_;
     
@@ -203,20 +214,6 @@ private:
      * Uses __enzyme_fwddiff to compute columns of J efficiently.
      */
     void compute_jacobian_enzyme(double t, const double* y, double* J);
-    
-    /**
-     * Compute Jᵀλ (vector-Jacobian product) using Enzyme reverse-mode.
-     * 
-     * This is the key operation for adjoint ODE:
-     *   λ' = -Jᵀλ
-     * 
-     * @param t    Current time
-     * @param y    State vector (from forward pass)
-     * @param lambda  Adjoint vector
-     * @param JTlambda  Output: Jᵀλ
-     */
-    void compute_JT_lambda(double t, const double* y, 
-                           const double* lambda, double* JTlambda);
     
     /**
      * Compute parameter sensitivity: (∂f/∂p)ᵀλ
@@ -384,10 +381,19 @@ inline void SaintVenantEnzyme::setup_cvodes() {
 inline void SaintVenantEnzyme::setup_adjoint() {
     if (!config_.enable_adjoint) return;
     
-    // Initialize adjoint module with checkpointing
+    // Initialize adjoint module with checkpointing. CVodeAdjInit allocates the adjoint
+    // checkpoint memory and MUST be called exactly once per cvode_mem; on subsequent
+    // recordings (e.g. each calibration iteration) we reset it with CVodeAdjReInit instead
+    // -- calling CVodeAdjInit twice leaks and corrupts the checkpoint structure.
     int interp = config_.use_hermite_interpolation ? CV_HERMITE : CV_POLYNOMIAL;
-    int flag = CVodeAdjInit(cvode_mem_, config_.adjoint_checkpoint_steps, interp);
-    
+    int flag;
+    if (!adjoint_initialized_) {
+        flag = CVodeAdjInit(cvode_mem_, config_.adjoint_checkpoint_steps, interp);
+        adjoint_initialized_ = (flag == CV_SUCCESS);
+    } else {
+        flag = CVodeAdjReInit(cvode_mem_);
+    }
+
     if (flag != CV_SUCCESS) {
         std::cerr << "Error initializing CVODES adjoint" << std::endl;
         return;
@@ -451,36 +457,50 @@ inline int SaintVenantEnzyme::adjoint_rhs_callback(sunrealtype t, N_Vector y,
     double* lambda = N_VGetArrayPointer(yB);
     double* lambda_dot = N_VGetArrayPointer(yBdot);
     
+    // λ' = -Jᵀλ. We build the full J with the stable FORWARD-mode Enzyme Jacobian and
+    // contract, rather than a reverse-mode VJP: reverse-mode __enzyme_autodiff segfaults
+    // in this build, so the entire adjoint path is forward-mode only.
+    std::vector<double> J(N * N);
 #ifdef DMC_USE_ENZYME
-    if (self->config_.use_enzyme_adjoint) {
-        // Use Enzyme reverse-mode for Jᵀλ
-        self->compute_JT_lambda(t, y_ptr, lambda, lambda_dot);
-        
-        // Negate for adjoint ODE: λ' = -Jᵀλ
-        for (int i = 0; i < N; ++i) {
-            lambda_dot[i] = -lambda_dot[i];
-        }
-    } else
-#endif
-    {
-        // Fallback: compute full Jacobian and multiply
-        std::vector<double> J(N * N);
-#ifdef DMC_USE_ENZYME
-        self->compute_jacobian_enzyme(t, y_ptr, J.data());
+    self->compute_jacobian_enzyme(t, y_ptr, J.data());
 #else
-        self->compute_jacobian_fd(t, y_ptr, J.data());
+    self->compute_jacobian_fd(t, y_ptr, J.data());
 #endif
-        
-        // λ' = -Jᵀλ
-        for (int i = 0; i < N; ++i) {
-            lambda_dot[i] = 0.0;
-            for (int j = 0; j < N; ++j) {
-                // J is column-major: J[j*N + i] = J(i,j)
-                lambda_dot[i] -= J[i * N + j] * lambda[j];  // -Jᵀλ
-            }
+    // J stored column-major: J[j*N + i] = J(i,j) = ∂ydot_i/∂y_j.
+    // (Jᵀλ)_i = Σ_j J(j,i) λ_j = Σ_j J[i*N + j] λ_j
+    for (int i = 0; i < N; ++i) {
+        double acc = 0.0;
+        for (int j = 0; j < N; ++j) acc += J[i * N + j] * lambda[j];
+        lambda_dot[i] = -acc;
+    }
+    // Running-cost source: the discrete loss L = sum_k l_k(Q(t_k)) is folded into a
+    // continuous adjoint source g_y(t) = dL/dQ(t_k(t))/dt at the gauge, so the WHOLE backward
+    // solve is a single CVodeB with NO per-observation CVodeReInitB. The per-step reinit was
+    // restarting the BDF integrator at order 1 every step, compounding error and washing out
+    // the costate (multi-reach gradients collapsed to near-equal values). λ' = -Jᵀλ - g_y.
+    // Observation k applies over (t_{k-1}, t_k]; with t_k = record_t0_+(k+1)*dt that is
+    // k(t) = ceil((t-record_t0_)/dt)-1, clamped to [0, N-1].
+    if (!self->dL_dQ_.empty()) {
+        const double dt = self->config_.dt;
+        int k = static_cast<int>(std::ceil((t - self->record_t0_) / dt)) - 1;
+        if (k < 0) k = 0;
+        if (k >= static_cast<int>(self->dL_dQ_.size())) k = static_cast<int>(self->dL_dQ_.size()) - 1;
+        lambda_dot[self->gauge_state_idx_] -= self->dL_dQ_[k] / dt;
+    }
+    if (self->config_.verbose) {
+        static int cnt = 0;
+        if ((cnt++ % 60) == 0) {
+            // per-reach forward Q (last node) and costate λ_Q (last node), to see whether λ
+            // is washed out (uniform across reaches) vs concentrated upstream as it should be.
+            std::cerr << "[adjcb] t=" << t << " yQ:";
+            for (int r = 0; r < self->n_reaches_; ++r)
+                std::cerr << " " << y_ptr[self->reach_state_offset_[r] + 2*(self->n_nodes_-1)+1];
+            std::cerr << "  lamQ:";
+            for (int r = 0; r < self->n_reaches_; ++r)
+                std::cerr << " " << lambda[self->reach_state_offset_[r] + 2*(self->n_nodes_-1)+1];
+            std::cerr << std::endl;
         }
     }
-    
     return 0;
 }
 
@@ -491,21 +511,16 @@ inline int SaintVenantEnzyme::quad_rhs_callback(sunrealtype t, N_Vector y,
     // Accumulates: dL/dp = ∫ λᵀ (∂f/∂p) dt
     
     SaintVenantEnzyme* self = static_cast<SaintVenantEnzyme*>(user_data);
-    
+
 #ifdef DMC_USE_ENZYME
-    if (self->config_.use_enzyme_adjoint) {
-        double* y_ptr = N_VGetArrayPointer(y);
-        double* lambda = N_VGetArrayPointer(yB);
-        double* grad = N_VGetArrayPointer(qBdot);
-        
-        self->compute_param_sensitivity(t, y_ptr, lambda, grad);
-    } else
+    // Parameter sensitivity (∂f/∂p)ᵀλ via stable forward-mode Enzyme.
+    double* y_ptr = N_VGetArrayPointer(y);
+    double* lambda = N_VGetArrayPointer(yB);
+    double* grad = N_VGetArrayPointer(qBdot);
+    self->compute_param_sensitivity(t, y_ptr, lambda, grad);
+#else
+    N_VConst(0.0, qBdot);
 #endif
-    {
-        // Zero if not using Enzyme
-        N_VConst(0.0, qBdot);
-    }
-    
     return 0;
 }
 
@@ -567,36 +582,6 @@ inline void SaintVenantEnzyme::compute_jacobian_enzyme(double t, const double* y
     }
 }
 
-inline void SaintVenantEnzyme::compute_JT_lambda(double t, const double* y,
-                                                  const double* lambda, 
-                                                  double* JTlambda) {
-    // Compute Jᵀλ using Enzyme reverse-mode
-    // This is a VJP (vector-Jacobian product)
-    
-    int N = total_state_size_;
-    
-    // Collect current parameters
-    std::vector<double> params(n_reaches_);
-    for (int r = 0; r < n_reaches_; ++r) {
-        params[r] = reach_geometry_[r].manning_n;
-    }
-    
-    // Initialize output gradient
-    std::fill(JTlambda, JTlambda + N, 0.0);
-    
-    // Dummy output buffer (enzyme_dupnoneed means we don't need primal output)
-    std::vector<double> ydot(N);
-    
-    // Reverse-mode AD: compute Jᵀλ where λ is the seed on ydot
-    // The gradient accumulates into the y shadow (JTlambda)
-    __enzyme_autodiff((void*)rhs_wrapper,
-        enzyme_const, t,
-        enzyme_dup, y, JTlambda,           // y and its gradient (Jᵀλ)
-        enzyme_const, params.data(),        // params constant for this call
-        enzyme_dup, ydot.data(), lambda,    // ydot primal and adjoint seed
-        enzyme_const, this);
-}
-
 inline void SaintVenantEnzyme::compute_param_sensitivity(double t, const double* y,
                                                           const double* lambda,
                                                           double* grad_p) {
@@ -614,18 +599,27 @@ inline void SaintVenantEnzyme::compute_param_sensitivity(double t, const double*
     
     // Initialize output gradients
     std::fill(grad_p, grad_p + P, 0.0);
-    
-    // Dummy buffers
-    std::vector<double> ydot(N);
-    std::vector<double> dy(N, 0.0);  // Not differentiating w.r.t. y here
-    
-    // Reverse-mode AD w.r.t. parameters
-    __enzyme_autodiff((void*)rhs_wrapper,
-        enzyme_const, t,
-        enzyme_const, y,                    // y is constant
-        enzyme_dup, params.data(), grad_p,  // params and their gradient
-        enzyme_dup, ydot.data(), lambda,    // ydot primal and adjoint seed
-        enzyme_const, this);
+
+    // Parameter sensitivity via FORWARD-mode AD (reverse-mode __enzyme_autodiff
+    // segfaults in this build; forward-mode __enzyme_fwddiff is stable). For each
+    // parameter p_r we seed dp_r = 1 and read dydot = ∂f/∂p_r, then contract with
+    // the adjoint state: (∂f/∂p_r)ᵀλ = Σ_i dydot_i · λ_i.
+    std::vector<double> dparams(P, 0.0);
+    std::vector<double> dydot(N, 0.0);
+    for (int r = 0; r < P; ++r) {
+        std::fill(dparams.begin(), dparams.end(), 0.0);
+        dparams[r] = 1.0;
+        std::fill(dydot.begin(), dydot.end(), 0.0);
+        __enzyme_fwddiff((void*)rhs_wrapper,
+            enzyme_const, t,
+            enzyme_const, y,                          // y held constant
+            enzyme_dup, params.data(), dparams.data(),// seed parameter r
+            enzyme_dupnoneed, nullptr, dydot.data(),  // tangent output ∂f/∂p_r
+            enzyme_const, this);
+        double s = 0.0;
+        for (int i = 0; i < N; ++i) s += dydot[i] * lambda[i];
+        grad_p[r] = s;
+    }
 }
 
 #endif // DMC_USE_ENZYME
@@ -715,18 +709,36 @@ inline void SaintVenantEnzyme::compute_rhs_with_params(
     double g = config_.g;
     double min_area = config_.min_area;
     const auto& topo_order = network_.topological_order();
-    
+
+    // Resolve the lateral forcing as a function of time t so the adjoint reconstruction
+    // reproduces the forward exactly. During/after recording use the per-step history
+    // (piecewise-constant in [t_k, t_{k+1})); otherwise fall back to the live member.
+    const bool use_hist = !lateral_history_.empty();
+    int lstep = 0;
+    if (use_hist) {
+        lstep = static_cast<int>(std::floor((t - record_t0_) / config_.dt));
+        if (lstep < 0) lstep = 0;
+        if (lstep >= static_cast<int>(lateral_history_.size()))
+            lstep = static_cast<int>(lateral_history_.size()) - 1;
+    }
+
     // Process each reach
     for (int r = 0; r < n_reaches_; ++r) {
         const Reach& reach = network_.get_reach(topo_order[r]);
         SVEGeometry geom = reach_geometry_[r];
-        geom.manning_n = params[r];  // Use parameter for this reach
-        
+        // NOTE: do NOT route the active parameter through geom.manning_n -- Enzyme drops the
+        // tangent through this struct member (geom is copied from an enzyme_const member).
+        // Instead pass params[r] directly into friction_slope below. geom.manning_n is left
+        // as-is and only used by the non-differentiated friction_slope(Q,A,R) overload, which
+        // we no longer call on this path.
+        const double manning_r = params[r];  // active parameter, flows straight into Sf
+
         double dx = reach.length / (n_nodes_ - 1);
         int off = reach_state_offset_[r];
-        
+
+        double lat_r = use_hist ? lateral_history_[lstep][r] : lateral_inflows_[r];
         // Lateral inflow per unit length
-        double q_lat = lateral_inflows_[r] / reach.length;
+        double q_lat = lat_r / reach.length;
         
         // Upstream boundary: sum of upstream reach outflows
         double Q_upstream = 0.0;
@@ -740,7 +752,7 @@ inline void SaintVenantEnzyme::compute_rhs_with_params(
                 }
             }
         }
-        Q_upstream += lateral_inflows_[r] * 0.5;  // Half at inlet
+        Q_upstream += lat_r * 0.5;  // Half at inlet
         
         // Interior nodes
         for (int j = 0; j < n_nodes_; ++j) {
@@ -790,7 +802,7 @@ inline void SaintVenantEnzyme::compute_rhs_with_params(
             double W_j = geom.width_from_area(A_j);
             double h_j = geom.depth_from_area(A_j, W_j);
             double R_j = geom.hydraulic_radius(A_j, W_j, h_j);
-            double Sf = geom.friction_slope(Q_j, A_j, R_j);
+            double Sf = geom.friction_slope(Q_j, A_j, R_j, manning_r);
             
             // dA/dt
             ydot[off + 2*j] = -(F_A_right - F_A_left) / dx + q_lat;
@@ -820,9 +832,16 @@ inline void SaintVenantEnzyme::compute_flux(
     double W_R = geom.width_from_area(A_R);
     double h_L = geom.depth_from_area(A_L, W_L);
     double h_R = geom.depth_from_area(A_R, W_R);
-    
-    double c_L = std::sqrt(g * h_L);
-    double c_R = std::sqrt(g * h_R);
+
+    // Floor depth inside the wave-celerity sqrt. d(sqrt(g h))/dh ~ 1/sqrt(h) blows up
+    // as h->0, so at near-dry states the forward-mode Jacobian becomes ill-conditioned
+    // and crashes the CVODES dense backward solve. Clamping to min_depth bounds the
+    // celerity derivative while leaving the (well-behaved) advective/pressure terms intact.
+    double hmin = config_.min_depth;
+    double hc_L = h_L > hmin ? h_L : hmin;
+    double hc_R = h_R > hmin ? h_R : hmin;
+    double c_L = std::sqrt(g * hc_L);
+    double c_R = std::sqrt(g * hc_R);
     
     double a_max = std::max(std::abs(u_L) + c_L, std::abs(u_R) + c_R);
     
@@ -847,6 +866,9 @@ inline void SaintVenantEnzyme::route_timestep() {
     
     int flag;
     if (recording_) {
+        // Record the lateral forcing for THIS step so the adjoint can reconstruct the
+        // forward RHS by time (forcing applies over [current_time_, current_time_+dt]).
+        lateral_history_.push_back(lateral_inflows_);
         // Forward with checkpointing for adjoint
         flag = CVodeF(cvode_mem_, tout, y_, &tret, CV_NORMAL, &ncheck_);
     } else {
@@ -937,9 +959,15 @@ inline void SaintVenantEnzyme::start_recording() {
     recording_ = true;
     recorded_times_.clear();
     recorded_states_.clear();
-    
+    lateral_history_.clear();
+    record_t0_ = current_time_;
+
 #ifdef DMC_ENABLE_SUNDIALS
     ncheck_ = 0;
+    // Snapshot the state at the start of recording so the forward checkpointed trajectory
+    // can be regenerated (with the complete forcing history) before the backward solve.
+    record_y0_.assign(N_VGetArrayPointer(y_),
+                      N_VGetArrayPointer(y_) + total_state_size_);
     setup_adjoint();
 #endif
 }
@@ -987,10 +1015,38 @@ inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id,
     // Reset gradient accumulators
     std::fill(grad_manning_n_.begin(), grad_manning_n_.end(), 0.0);
     
+    // --- Regenerate the checkpointed forward trajectory with the COMPLETE forcing history.
+    // During the live forward pass lateral_history_ is built up one step at a time, so at
+    // each window endpoint the time->step index clamps down to the last-pushed entry. The
+    // adjoint reconstruction (CVAdataStore), however, runs after recording finishes and sees
+    // the COMPLETE history, so the same endpoint maps to the next step's forcing. With
+    // time-varying forcing those differ, the reconstruction's adaptive stepping diverges from
+    // the forward pass, overruns the pre-allocated checkpoint buffer, and dereferences NULL.
+    // Re-running the forward here -- history now complete and fixed -- makes the checkpoints
+    // bit-consistent with reconstruction. (Confirmed root cause: constant-in-time forcing
+    // never crashes; time-varying forcing crashes at exit 139, fixed by this regeneration.)
+    {
+        N_Vector y0 = N_VNew_Serial(total_state_size_, sunctx_);
+        std::copy(record_y0_.begin(), record_y0_.end(), N_VGetArrayPointer(y0));
+        CVodeReInit(cvode_mem_, record_t0_, y0);
+        CVodeAdjReInit(cvode_mem_);
+        sunrealtype tret; int nck = 0;
+        for (size_t k = 0; k < recorded_times_.size(); ++k) {
+            int fflag = CVodeF(cvode_mem_, recorded_times_[k], y_, &tret, CV_NORMAL, &nck);
+            if (fflag < 0) {
+                std::cerr << "Forward checkpoint regeneration error " << fflag
+                          << " at t=" << recorded_times_[k] << std::endl;
+                break;
+            }
+        }
+        ncheck_ = nck;
+        N_VDestroy(y0);
+    }
+
     // Backward integration through recorded times
     // Start from final time
     double t_final = recorded_times_.back();
-    
+
     // Create backward problem
     int flag = CVodeCreateB(cvode_mem_, CV_BDF, &indexB_);
     if (flag != CV_SUCCESS) {
@@ -998,14 +1054,23 @@ inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id,
         return;
     }
     
-    // Initialize backward problem at final time
-    // Terminal condition: λ(T) = dL/dQ * e_{gauge}
-    N_VGetArrayPointer(yB_)[gauge_state_idx_] = dL_dQ.back();
-    
+    // Store the per-observation loss gradient; the adjoint RHS consumes it as a continuous
+    // running-cost source (see adjoint_rhs_callback). Terminal condition is therefore
+    // λ(T) = 0 -- ALL observations (including the one at t_final) enter via the source term.
+    dL_dQ_ = dL_dQ;
+    N_VConst(0.0, yB_);
+
     flag = CVodeInitB(cvode_mem_, indexB_, adjoint_rhs_callback, t_final, yB_);
     flag = CVodeSStolerancesB(cvode_mem_, indexB_, config_.rel_tol, config_.abs_tol);
     flag = CVodeSetUserDataB(cvode_mem_, indexB_, this);
-    
+    // The running-cost source g_y(t) is piecewise-constant with a jump at every observation
+    // time (stride dt), which forces the BDF integrator to take many tiny steps on the
+    // backward solve. CVodeB defaults to mxstep=500 (it does NOT inherit the forward
+    // CVodeSetMaxNumSteps), so without this the backward integration dies with a -1 mxstep
+    // error a few percent of the way home -- leaving the quadrature with a tiny fraction of
+    // the true gradient (observed: AD ~1000x smaller than FD). Raise it generously.
+    flag = CVodeSetMaxNumStepsB(cvode_mem_, indexB_, 1000000);
+
     // Create linear solver for backward problem
     SUNMatrix JB = SUNDenseMatrix(total_state_size_, total_state_size_, sunctx_);
     SUNLinearSolver LSB = SUNLinSol_Dense(yB_, JB, sunctx_);
@@ -1018,26 +1083,43 @@ inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id,
     flag = CVodeQuadSStolerancesB(cvode_mem_, indexB_, config_.rel_tol, config_.abs_tol);
     flag = CVodeSetQuadErrConB(cvode_mem_, indexB_, SUNTRUE);
     
-    // Backward integration
-    for (int k = recorded_times_.size() - 2; k >= 0; --k) {
-        double t_target = recorded_times_[k];
-        
-        flag = CVodeB(cvode_mem_, t_target, CV_NORMAL);
-        if (flag < 0) {
-            std::cerr << "Backward integration error at t=" << t_target << std::endl;
-        }
-        
-        // Add impulse from dL/dQ at this time
-        // λ += dL/dQ(t_k) * e_{gauge}
-        N_VGetArrayPointer(yB_)[gauge_state_idx_] += dL_dQ[k];
+    // Backward integration of the discrete-observation adjoint.
+    // The loss L = sum_k l_k(Q(t_k)) contributes an impulse dL/dQ(t_k) to the adjoint at
+    // every observation time; between observations the adjoint obeys lambda' = -J^T lambda.
+    // Rather than the textbook approach of stepping CVodeB to each t_k and applying the
+    // impulse via CVodeGetB/CVodeReInitB (which restarts BDF at order 1 every step ->
+    // compounding error that washes out the multi-reach costate), we fold the impulses into
+    // a single continuous running-cost source g_y(t) in adjoint_rhs_callback and do ONE
+    // CVodeB from t_final to record_t0_. Terminal condition lambda(t_final) = 0.
+    const bool dbg = config_.verbose;
+    if (dbg) {
+        std::cerr << "[adj] gauge_state_idx=" << gauge_state_idx_
+                  << " t_final=" << t_final << " record_t0=" << record_t0_
+                  << " N_obs=" << recorded_times_.size() << std::endl;
     }
-    
-    // Get final quadrature (parameter gradients)
-    flag = CVodeGetQuadB(cvode_mem_, indexB_, &current_time_, qB);
-    
+    sunrealtype tBret;
+    // SINGLE continuous backward solve from t_final to record_t0_, no per-observation reinit.
+    // The discrete observations enter as the running-cost source in adjoint_rhs_callback.
+    flag = CVodeB(cvode_mem_, record_t0_, CV_NORMAL);
+    if (flag < 0) {
+        std::cerr << "Backward integration error " << flag
+                  << " integrating to t=" << record_t0_ << std::endl;
+    }
+
+    // Final accumulated quadrature (parameter gradients).
+    // CVODES integrates the backward problem (and its quadrature) from t_final down to t0,
+    // so CVodeGetQuadB returns the integral over the BACKWARD path; dL/dp = +integral over
+    // forward time, hence the sign flip below (validated: single-step adjoint matches FD).
+    flag = CVodeGetQuadB(cvode_mem_, indexB_, &tBret, qB);
+
     double* grad = N_VGetArrayPointer(qB);
     for (int r = 0; r < n_reaches_; ++r) {
-        grad_manning_n_[r] = grad[r];
+        grad_manning_n_[r] = -grad[r];
+    }
+    if (dbg) {
+        std::cerr << "[adj] final grad:";
+        for (int r = 0; r < n_reaches_; ++r) std::cerr << " " << grad_manning_n_[r];
+        std::cerr << std::endl;
     }
     
     // Cleanup backward problem

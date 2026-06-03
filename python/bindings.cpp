@@ -1400,6 +1400,9 @@ static double routing_objective(
          )doc")
          .def(py::init<Network&, SaintVenantConfig>(),
              py::arg("network"), py::arg("config") = SaintVenantConfig(),
+             // Router stores Network& by reference; tie the Network's lifetime to the
+             // router so a Python-local Network can't be freed out from under it.
+             py::keep_alive<1, 2>(),
              "Create SVE router with network and configuration")
          
          // Core routing
@@ -1456,7 +1459,9 @@ static double routing_objective(
          .def_readwrite("use_enzyme_jacobian", &SaintVenantEnzymeConfig::use_enzyme_jacobian,
              "Use Enzyme AD for Jacobian computation")
          .def_readwrite("use_enzyme_adjoint", &SaintVenantEnzymeConfig::use_enzyme_adjoint,
-             "Use Enzyme AD for adjoint RHS computation");
+             "Use Enzyme AD for adjoint RHS computation")
+         .def_readwrite("verbose", &SaintVenantEnzymeConfig::verbose,
+             "Print debug/diagnostic information");
  
      py::class_<SaintVenantEnzyme>(m, "SaintVenantEnzyme",
          R"doc(
@@ -1495,6 +1500,12 @@ static double routing_objective(
          
          .def(py::init<Network&, SaintVenantEnzymeConfig>(),
              py::arg("network"), py::arg("config") = SaintVenantEnzymeConfig(),
+             // The router stores Network& by reference and dereferences it in
+             // compute_gradients() (topological_order/get_reach). Without this, a
+             // Python-local Network freed before the router is used leaves network_
+             // dangling -> NULL topo-scan crash in compute_gradients. keep_alive<1,2>
+             // ties the Network's lifetime to the router (self=1, network=2).
+             py::keep_alive<1, 2>(),
              "Create Enzyme-enabled Saint-Venant router")
          
          // Core routing
