@@ -737,8 +737,13 @@ inline void SaintVenantEnzyme::compute_rhs_with_params(
         int off = reach_state_offset_[r];
 
         double lat_r = use_hist ? lateral_history_[lstep][r] : lateral_inflows_[r];
-        // Lateral inflow per unit length
-        double q_lat = lat_r / reach.length;
+        // Lateral inflow as a source DENSITY (per unit length) on dA/dt. The reach is
+        // discretized as n_nodes cells each of width dx (= length/(n_nodes-1)), so q_lat is
+        // added at all n_nodes nodes and integrates to q_lat * n_nodes * dx. To inject
+        // exactly lat_r we must divide by (n_nodes*dx), NOT by reach.length -- the latter
+        // over-injects by n_nodes/(n_nodes-1) (e.g. 4/3 for n_nodes=4), the residual mass
+        // leak after removing the inlet double-count (single reach 100 in -> 133 out).
+        double q_lat = lat_r / (n_nodes_ * dx);
         
         // Upstream boundary: sum of upstream reach outflows
         double Q_upstream = 0.0;
@@ -752,8 +757,14 @@ inline void SaintVenantEnzyme::compute_rhs_with_params(
                 }
             }
         }
-        Q_upstream += lat_r * 0.5;  // Half at inlet
-        
+        // NOTE: do NOT add lateral inflow here. lat_r is already injected in full as the
+        // distributed source q_lat (see above) on dA/dt at every node, which integrates
+        // (via continuity dA/dt = -dQ/dx + q_lat) to exactly lat_r of added volume over the
+        // reach. The old `Q_upstream += lat_r*0.5` double-counted it as an extra inlet flux
+        // (proven non-conservative: a single reach with constant 100 m^3/s in settled to
+        // ~183 out), which compounded into a ~660x blow-up on the cascaded Calgary network.
+        // The inlet flux is purely the sum of upstream-reach outflows.
+
         // Interior nodes
         for (int j = 0; j < n_nodes_; ++j) {
             double A_j = y[off + 2*j];
