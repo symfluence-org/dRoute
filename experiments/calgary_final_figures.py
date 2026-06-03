@@ -23,14 +23,22 @@ from droute.lake_preprocessor import classify_lakes
 D = "/Users/darri.eythorsson/compHydro/SYMFLUENCE_data/domain_Bow_at_Calgary"
 RES = "/Users/darri.eythorsson/compHydro/code/dRoute/experiments/results_calgary"
 
-# WSC gauge coordinates (from GeoMet hydrometric-stations)
+# WSC gauge coordinates (from GeoMet hydrometric-stations API, api.weather.gc.ca).
+# Mainstem nested gauges first (upstream -> downstream), then tributary gauges.
 GAUGES = {
-    "05BA001": ("Lake Louise", 51.429, -116.189),
+    "05BA001": ("Lake Louise", 51.4286, -116.1889),
     "05BB001": ("Banff", 51.172, -115.572),
     "05BE004": ("Seebe", 51.119, -115.033),
     "05BH005": ("Cochrane", 51.174, -114.466),
-    "05BH004": ("Calgary", 51.050, -114.051),
+    "05BH004": ("Calgary", 51.0503, -114.0515),
+    "05BA002": ("Pipestone R.", 51.4331, -116.1749),
+    "05BC008": ("Goat Ck", 51.0583, -115.4306),
+    "05BF003": ("Kananaskis R.", 50.7000, -115.1181),
+    "05BG006": ("Waiparous Ck", 51.2828, -114.8384),
+    "05BH015": ("Jumpingpound Ck", 51.1283, -114.5675),
 }
+# The 5 nested Bow mainstem gauges (rendered as large stars); the rest are tributary gauges.
+MAINSTEM = {"05BA001", "05BB001", "05BE004", "05BH005", "05BH004"}
 
 
 def clip_raster(path, basins):
@@ -82,12 +90,16 @@ def make_map():
 
     east_edge = bnds[2]
     for sid, (name, lat, lon) in GAUGES.items():
-        ax.plot(lon, lat, marker="*", ms=18, mfc="#ffd400", mec="black", mew=1.0, zorder=10)
+        main = sid in MAINSTEM
+        ax.plot(lon, lat, marker="*" if main else "o",
+                ms=18 if main else 9, mfc="#ffd400" if main else "#39c2c9",
+                mec="black", mew=1.0 if main else 0.8, zorder=10)
         # label to the left for gauges near the east edge (avoid clipping), else to the right
         left = lon > east_edge - 0.25
         ax.annotate(f"{name}\n{sid}", (lon, lat),
                     xytext=(-6 if left else 6, 6), textcoords="offset points",
-                    ha="right" if left else "left", fontsize=8, weight="bold", zorder=11,
+                    ha="right" if left else "left", fontsize=8 if main else 6.5,
+                    weight="bold" if main else "normal", zorder=11,
                     bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="0.5", alpha=0.85))
     ax.set_xlim(bnds[0] - pad, bnds[2] + pad); ax.set_ylim(bnds[1] - pad, bnds[3] + pad)
     ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
@@ -95,7 +107,8 @@ def make_map():
             norm=plt.Normalize(np.nanpercentile(dem, 2), np.nanpercentile(dem, 98)))
     fig.colorbar(sm, ax=ax, shrink=0.55, label="Elevation (m)")
     handles = [
-        plt.Line2D([0], [0], marker="*", ls="", mfc="#ffd400", mec="black", ms=13, label="WSC gauge"),
+        plt.Line2D([0], [0], marker="*", ls="", mfc="#ffd400", mec="black", ms=13, label="WSC gauge (mainstem)"),
+        plt.Line2D([0], [0], marker="o", ls="", mfc="#39c2c9", mec="black", ms=8, label="WSC gauge (tributary)"),
         mpatches.Patch(fc="#d63a2e", ec="white", label="Reservoir (inline)"),
         mpatches.Patch(fc="#2e86d6", ec="white", label="Natural lake (inline)"),
         mpatches.Patch(fc="#7ab8e8", label="Subgrid lake"),
@@ -114,6 +127,7 @@ def make_hydrographs():
     z = np.load(f"{RES}/joint_calib.npz", allow_pickle=True)
     dates = pd.to_datetime(z["dates"]); labels = z["gauge_labels"]; stations = z["gauge_stations"]
     qb, qc, obs = z["q_base"], z["q_lake_cal"], z["obs"]
+    is_calib = z["gauge_is_calib"] if "gauge_is_calib" in z.files else np.ones(len(labels), bool)
     # plot only the evaluation window (exclude the routing spin-up year)
     ev = dates >= pd.Timestamp("2011-01-01")
     dates, qb, qc, obs = dates[ev], qb[ev], qc[ev], obs[ev]
@@ -131,12 +145,15 @@ def make_hydrographs():
         ax.plot(dates, obs[:, i], "k", lw=1.1, label="WSC obs", zorder=4)
         ax.plot(dates, qb[:, i], color="#d9772b", lw=0.8, alpha=0.85, label=f"baseline, no lakes (KGE {kb:.2f})")
         ax.plot(dates, qc[:, i], color="#2ca02c", lw=0.9, alpha=0.9, label=f"lakes, joint-calibrated (KGE {kc:.2f})")
-        ax.set_title(f"{labels[i]}  [{stations[i]}, seg {int(z['gauge_segs'][i])}]  obs mean {np.nanmean(obs[:,i]):.0f} m³/s",
-                     fontsize=9)
+        role = "calib target" if is_calib[i] else "eval only"
+        ax.set_title(f"{labels[i]}  [{stations[i]}, seg {int(z['gauge_segs'][i])}, {role}]  "
+                     f"obs mean {np.nanmean(obs[:,i]):.0f} m³/s", fontsize=9)
         ax.set_ylabel("Q (m³/s)", fontsize=8); ax.grid(alpha=0.25); ax.legend(fontsize=7.5, loc="upper right")
     axes[-1].set_xlabel("Date")
-    fig.suptitle(f"Bow at Calgary — nested-gauge hydrographs: dRoute baseline vs joint gradient-calibrated routing\n"
-                 f"(SUMMA-calibrated runoff; mean KGE {float(z['kge_base']):.3f} → {float(z['kge_cal']):.3f})",
+    n_cal = int(np.sum(is_calib))
+    fig.suptitle(f"Bow at Calgary — multi-gauge hydrographs: dRoute baseline vs joint gradient-calibrated routing\n"
+                 f"(SUMMA-calibrated runoff; calibrated on {n_cal} routing-fittable gauges, "
+                 f"mean KGE {float(z['kge_base']):.3f} → {float(z['kge_cal']):.3f})",
                  fontsize=12, weight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(f"{RES}/final_hydrographs.png", dpi=160, bbox_inches="tight")
