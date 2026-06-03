@@ -1460,6 +1460,9 @@ static double routing_objective(
              "Use Enzyme AD for Jacobian computation")
          .def_readwrite("use_enzyme_adjoint", &SaintVenantEnzymeConfig::use_enzyme_adjoint,
              "Use Enzyme AD for adjoint RHS computation")
+         .def_readwrite("use_colored_jacobian", &SaintVenantEnzymeConfig::use_colored_jacobian,
+             "Assemble the Jacobian via graph-colored forward-mode Enzyme (O(#colors) passes) "
+             "instead of dense column-by-column (O(state size)). Default true.")
          .def_readwrite("verbose", &SaintVenantEnzymeConfig::verbose,
              "Print debug/diagnostic information");
  

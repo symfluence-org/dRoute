@@ -67,6 +67,13 @@ struct SaintVenantEnzymeConfig : public SaintVenantConfig {
     bool use_enzyme_jacobian = true;      // Use Enzyme for Jacobian (vs FD)
     bool use_enzyme_adjoint = true;       // Use Enzyme for adjoint RHS
 
+    // Sparse-coloring options. The SV Jacobian is structurally sparse (each state couples only
+    // to its reach's node-neighbours plus the outlet-Q -> downstream-inlet link), so a
+    // graph-colored forward-mode Enzyme sweep builds it in O(#colors) passes (~7) instead of
+    // O(state size) (~hundreds-thousands) -- dimension-independent cost. Set false to fall back
+    // to the dense column-by-column Jacobian (validation reference).
+    bool use_colored_jacobian = true;
+
     // Debug options
     bool verbose = false;                 // Print debug information during initialization
 };
@@ -171,7 +178,16 @@ private:
 
     // Gradients (accumulated during backward pass)
     std::vector<double> grad_manning_n_;
-    
+
+    // Sparse-Jacobian coloring (Curtis-Powell-Reid). Built once from the network topology +
+    // the SV stencil; lets compute_jacobian_enzyme assemble J in n_colors_ forward-mode passes
+    // instead of total_state_size_. See build_jacobian_sparsity().
+    std::vector<int> downstream_reach_;          // [topo idx] -> topo idx of the reach downstream (or -1)
+    std::vector<std::vector<int>> col_rows_;     // [column] -> row indices it affects (J sparsity, by column)
+    std::vector<std::vector<int>> color_cols_;   // [color]  -> columns sharing that color (structurally orthogonal)
+    int n_colors_ = 0;
+    bool sparsity_built_ = false;
+
     // =========== Core computation methods ===========
     
     void initialize_state();
@@ -214,7 +230,21 @@ private:
      * Uses __enzyme_fwddiff to compute columns of J efficiently.
      */
     void compute_jacobian_enzyme(double t, const double* y, double* J);
-    
+
+    /**
+     * Build the structural sparsity pattern of the Jacobian and a CPR column coloring.
+     * Called lazily (once) before the first colored Jacobian assembly.
+     */
+    void build_jacobian_sparsity();
+
+    /**
+     * Compute the (dense-stored) Jacobian via the graph-colored forward-mode sweep:
+     * one __enzyme_fwddiff per color (structurally-orthogonal columns seeded together),
+     * scattering results back through the sparsity pattern. Numerically identical to
+     * compute_jacobian_enzyme but O(#colors) passes instead of O(state size).
+     */
+    void compute_jacobian_enzyme_colored(double t, const double* y, double* J);
+
     /**
      * Compute parameter sensitivity: (∂f/∂p)ᵀλ
      * 
@@ -434,7 +464,10 @@ inline int SaintVenantEnzyme::jac_callback(sunrealtype t, N_Vector y, N_Vector f
     
 #ifdef DMC_USE_ENZYME
     if (self->config_.use_enzyme_jacobian) {
-        self->compute_jacobian_enzyme(t, N_VGetArrayPointer(y), SUNDenseMatrix_Data(J));
+        if (self->config_.use_colored_jacobian)
+            self->compute_jacobian_enzyme_colored(t, N_VGetArrayPointer(y), SUNDenseMatrix_Data(J));
+        else
+            self->compute_jacobian_enzyme(t, N_VGetArrayPointer(y), SUNDenseMatrix_Data(J));
     } else {
         self->compute_jacobian_fd(t, N_VGetArrayPointer(y), SUNDenseMatrix_Data(J));
     }
@@ -462,7 +495,10 @@ inline int SaintVenantEnzyme::adjoint_rhs_callback(sunrealtype t, N_Vector y,
     // in this build, so the entire adjoint path is forward-mode only.
     std::vector<double> J(N * N);
 #ifdef DMC_USE_ENZYME
-    self->compute_jacobian_enzyme(t, y_ptr, J.data());
+    if (self->config_.use_colored_jacobian)
+        self->compute_jacobian_enzyme_colored(t, y_ptr, J.data());
+    else
+        self->compute_jacobian_enzyme(t, y_ptr, J.data());
 #else
     self->compute_jacobian_fd(t, y_ptr, J.data());
 #endif
@@ -582,6 +618,108 @@ inline void SaintVenantEnzyme::compute_jacobian_enzyme(double t, const double* y
     }
 }
 
+inline void SaintVenantEnzyme::build_jacobian_sparsity() {
+    // --- Structural sparsity of J(i,j) = ∂ydot_i/∂y_j, derived from the SV stencil. ---
+    // State layout per reach r (topo idx i): [A_0,Q_0,...,A_{n-1},Q_{n-1}] at reach_state_offset_[i].
+    // Row (i,j) = ydot of node j in reach i depends on columns:
+    //   - (i,j-1),(i,j),(i,j+1)  [Rusanov left/right fluxes + local source/friction]
+    //   - for j==0: the outlet Q (node n-1, var Q) of every UPSTREAM reach, via Q_upstream.
+    // Equivalently, by COLUMN: column (i,j,v) affects rows (i,j-1),(i,j),(i,j+1), and -- only for
+    // the outlet Q column (j==n-1, v==Q) -- the node-0 rows of the single downstream reach.
+    const int N = total_state_size_;
+    const int nn = n_nodes_;
+    const auto& topo = network_.topological_order();
+
+    // downstream reach (topo idx) for each reach: the reach whose inlet junction is r's outlet junction.
+    downstream_reach_.assign(n_reaches_, -1);
+    for (int i = 0; i < n_reaches_; ++i) {
+        int dj = network_.get_reach(topo[i]).downstream_junction_id;
+        for (int k = 0; k < n_reaches_; ++k) {
+            if (network_.get_reach(topo[k]).upstream_junction_id == dj) { downstream_reach_[i] = k; break; }
+        }
+    }
+
+    auto cidx = [&](int i, int j, int v) { return reach_state_offset_[i] + 2 * j + v; };
+    col_rows_.assign(N, {});
+    for (int i = 0; i < n_reaches_; ++i) {
+        for (int j = 0; j < nn; ++j) {
+            for (int v = 0; v < 2; ++v) {
+                int c = cidx(i, j, v);
+                std::vector<int>& rs = col_rows_[c];
+                for (int jp = j - 1; jp <= j + 1; ++jp) {
+                    if (jp < 0 || jp >= nn) continue;
+                    rs.push_back(cidx(i, jp, 0));
+                    rs.push_back(cidx(i, jp, 1));
+                }
+                if (j == nn - 1 && v == 1 && downstream_reach_[i] >= 0) {
+                    int d = downstream_reach_[i];
+                    rs.push_back(cidx(d, 0, 0));
+                    rs.push_back(cidx(d, 0, 1));
+                }
+            }
+        }
+    }
+
+    // --- Greedy distance-1 column coloring (CPR): two columns conflict iff they share a row;
+    // columns of the same color are then structurally orthogonal and can be seeded together. ---
+    std::vector<std::vector<int>> row_cols(N);
+    for (int c = 0; c < N; ++c)
+        for (int i : col_rows_[c]) row_cols[i].push_back(c);
+
+    std::vector<int> col_color(N, -1);
+    std::vector<int> forbidden(N, -1);  // forbidden[color] = last column that forbade it
+    n_colors_ = 0;
+    for (int c = 0; c < N; ++c) {
+        // mark colors used by columns conflicting with c (sharing any row)
+        for (int i : col_rows_[c])
+            for (int other : row_cols[i])
+                if (other != c && col_color[other] >= 0) forbidden[col_color[other]] = c;
+        int k = 0;
+        while (k < n_colors_ && forbidden[k] == c) ++k;
+        if (k == n_colors_) ++n_colors_;
+        col_color[c] = k;
+    }
+    color_cols_.assign(n_colors_, {});
+    for (int c = 0; c < N; ++c) color_cols_[col_color[c]].push_back(c);
+    sparsity_built_ = true;
+
+    if (config_.verbose) {
+        std::cerr << "[sparsity] state=" << N << " colors=" << n_colors_
+                  << " -> " << (n_colors_ > 0 ? N / n_colors_ : 0)
+                  << "x fewer Enzyme passes per Jacobian" << std::endl;
+    }
+}
+
+inline void SaintVenantEnzyme::compute_jacobian_enzyme_colored(double t, const double* y, double* J) {
+    if (!sparsity_built_) build_jacobian_sparsity();
+    const int N = total_state_size_;
+
+    std::vector<double> params(n_reaches_);
+    for (int r = 0; r < n_reaches_; ++r) params[r] = reach_geometry_[r].manning_n;
+
+    // Dense storage, structural zeros must be explicitly zeroed (we only scatter nonzeros).
+    std::fill(J, J + (size_t)N * N, 0.0);
+
+    std::vector<double> dy(N, 0.0), dydot(N, 0.0);
+    for (int color = 0; color < n_colors_; ++color) {
+        std::fill(dy.begin(), dy.end(), 0.0);
+        for (int c : color_cols_[color]) dy[c] = 1.0;     // seed all columns of this color at once
+        std::fill(dydot.begin(), dydot.end(), 0.0);
+
+        __enzyme_fwddiff((void*)rhs_wrapper,
+            enzyme_const, t,
+            enzyme_dup, y, dy.data(),
+            enzyme_const, params.data(),
+            enzyme_dupnoneed, nullptr, dydot.data(),
+            enzyme_const, this);
+
+        // Recover: for each column c in this color, rows it owns are structurally disjoint from
+        // every other seeded column, so dydot[i] == J(i,c) exactly. Scatter (column-major).
+        for (int c : color_cols_[color])
+            for (int i : col_rows_[c]) J[(size_t)c * N + i] = dydot[i];
+    }
+}
+
 inline void SaintVenantEnzyme::compute_param_sensitivity(double t, const double* y,
                                                           const double* lambda,
                                                           double* grad_p) {
@@ -600,24 +738,26 @@ inline void SaintVenantEnzyme::compute_param_sensitivity(double t, const double*
     // Initialize output gradients
     std::fill(grad_p, grad_p + P, 0.0);
 
-    // Parameter sensitivity via FORWARD-mode AD (reverse-mode __enzyme_autodiff
-    // segfaults in this build; forward-mode __enzyme_fwddiff is stable). For each
-    // parameter p_r we seed dp_r = 1 and read dydot = ∂f/∂p_r, then contract with
-    // the adjoint state: (∂f/∂p_r)ᵀλ = Σ_i dydot_i · λ_i.
-    std::vector<double> dparams(P, 0.0);
+    // Parameter sensitivity via FORWARD-mode AD (reverse-mode __enzyme_autodiff segfaults in
+    // this build; forward-mode __enzyme_fwddiff is stable). Manning's n_r is REACH-LOCAL --
+    // ∂f/∂p_r is nonzero only on reach r's rows -- so the parameters are mutually structurally
+    // orthogonal and ALL of ∂f/∂p can be read from a SINGLE pass that seeds every dp_r = 1:
+    // dydot_i = ∂f_i/∂p_{r(i)} where r(i) is the reach owning row i. Then
+    //   grad_p[r] = (∂f/∂p_r)ᵀλ = Σ_{i ∈ reach r} dydot_i · λ_i.
+    // (Was P separate passes; now 1 -- the per-parameter analogue of the colored Jacobian.)
+    std::vector<double> dparams(P, 1.0);
     std::vector<double> dydot(N, 0.0);
+    __enzyme_fwddiff((void*)rhs_wrapper,
+        enzyme_const, t,
+        enzyme_const, y,                          // y held constant
+        enzyme_dup, params.data(), dparams.data(),// seed ALL parameters at once
+        enzyme_dupnoneed, nullptr, dydot.data(),  // tangent output Σ_r ∂f/∂p_r
+        enzyme_const, this);
     for (int r = 0; r < P; ++r) {
-        std::fill(dparams.begin(), dparams.end(), 0.0);
-        dparams[r] = 1.0;
-        std::fill(dydot.begin(), dydot.end(), 0.0);
-        __enzyme_fwddiff((void*)rhs_wrapper,
-            enzyme_const, t,
-            enzyme_const, y,                          // y held constant
-            enzyme_dup, params.data(), dparams.data(),// seed parameter r
-            enzyme_dupnoneed, nullptr, dydot.data(),  // tangent output ∂f/∂p_r
-            enzyme_const, this);
         double s = 0.0;
-        for (int i = 0; i < N; ++i) s += dydot[i] * lambda[i];
+        int lo = reach_state_offset_[r];
+        int hi = lo + 2 * n_nodes_;               // reach r owns state indices [lo, hi)
+        for (int i = lo; i < hi; ++i) s += dydot[i] * lambda[i];
         grad_p[r] = s;
     }
 }
