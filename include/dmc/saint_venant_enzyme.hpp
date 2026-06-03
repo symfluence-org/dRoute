@@ -126,7 +126,18 @@ public:
      * @param dL_dQ           Gradient of loss w.r.t. Q at each recorded time [n_times]
      */
     void compute_gradients(int gauge_reach_id, const std::vector<double>& dL_dQ);
-    
+
+    /**
+     * Multi-gauge gradient: loss L = sum_g sum_k l_{g,k}(Q_g(t_k)) over several gauges.
+     * Injects every gauge's running-cost source into a SINGLE backward solve (one CVodeB),
+     * so the cost is that of one gradient, not one-per-gauge.
+     *
+     * @param gauge_reach_ids  reach IDs of the gauges
+     * @param dL_dQ_per_gauge  per gauge, dL/dQ_g at each recorded time [n_gauges][n_times]
+     */
+    void compute_gradients_multigauge(const std::vector<int>& gauge_reach_ids,
+                                      const std::vector<std::vector<double>>& dL_dQ_per_gauge);
+
     /**
      * Get gradients for all parameters.
      * @return Map from "reach_X_manning_n" to gradient value
@@ -174,7 +185,11 @@ private:
     double record_t0_ = 0.0;                            // time at start of recording
     std::vector<double> record_y0_;                     // packed state at start of recording
     bool adjoint_initialized_ = false;                  // CVodeAdjInit called exactly once
-    std::vector<double> dL_dQ_;                          // per-observation dL/dQ(t_k) (running-cost source)
+    // Loss sources for the backward solve: one (gauge state index, per-observation dL/dQ(t_k))
+    // pair PER GAUGE. A multi-gauge loss L = sum_g sum_k l_{g,k}(Q_g(t_k)) injects every gauge's
+    // running-cost source into a SINGLE CVodeB (see adjoint_rhs_callback) -- so multi-gauge
+    // calibration costs one backward solve, not one-per-gauge.
+    std::vector<std::pair<int, std::vector<double>>> gauge_sources_;
 
     // Gradients (accumulated during backward pass)
     std::vector<double> grad_manning_n_;
@@ -298,6 +313,11 @@ private:
     void setup_cvodes();
     void setup_adjoint();
     void cleanup_cvodes();
+
+    // Shared backward adjoint solve: assumes gauge_sources_ and recorded_times_ are populated.
+    // Regenerates the checkpointed forward, runs ONE CVodeB with the running-cost source(s),
+    // and accumulates dL/dn into grad_manning_n_. Used by both single- and multi-gauge entries.
+    void run_adjoint_backward();
 #endif
 };
 
@@ -509,12 +529,12 @@ inline int SaintVenantEnzyme::adjoint_rhs_callback(sunrealtype t, N_Vector y,
         for (int j = 0; j < N; ++j) acc += J[i * N + j] * lambda[j];
         lambda_dot[i] = -acc;
     }
-    // Running-cost source: the discrete loss L = sum_k l_k(Q(t_k)) is folded into a continuous
-    // adjoint source g_y(t) = dL/dQ at the gauge, so the WHOLE backward solve is a single CVodeB
-    // with NO per-observation CVodeReInitB (per-step reinit restarted BDF at order 1, washing out
-    // the costate). λ' = -Jᵀλ - g_y.
+    // Running-cost source(s): the discrete loss L = sum_g sum_k l_{g,k}(Q_g(t_k)) is folded into a
+    // continuous adjoint source g_y(t) = dL/dQ at EACH gauge, so the WHOLE backward solve is a
+    // single CVodeB with NO per-observation CVodeReInitB (per-step reinit restarted BDF at order 1,
+    // washing out the costate) AND multi-gauge costs one solve, not one-per-gauge. λ' = -Jᵀλ - g_y.
     //
-    // The source is sampled at observation times t_k = record_t0_ + (k+1)*dt (dL_dQ_[k]) and is
+    // Each gauge's source is sampled at observation times t_k = record_t0_ + (k+1)*dt and is
     // injected as a TIME-CONTINUOUS (piecewise-LINEAR) interpolant, NOT a piecewise-constant
     // boxcar. The boxcar jumps at every t_k crashed the BDF step controller (error-test failure ->
     // step-size collapse -> low-order restart at each dt), forcing ~87 substeps per output step
@@ -522,19 +542,23 @@ inline int SaintVenantEnzyme::adjoint_rhs_callback(sunrealtype t, N_Vector y,
     // jumps (C0 source) so the integrator can take large implicit steps through the stiff-but-
     // smooth adjoint; the gradient is unchanged in the dense-observation limit (verified: gradcheck
     // recovery still passes). At t_k, s := (t-record_t0_)/dt - 1 == k.
-    if (!self->dL_dQ_.empty()) {
+    {
         const double dt = self->config_.dt;
-        const int M = static_cast<int>(self->dL_dQ_.size());
-        double s = (t - self->record_t0_) / dt - 1.0;
-        double src;
-        if (s <= 0.0) src = self->dL_dQ_[0];
-        else if (s >= M - 1) src = self->dL_dQ_[M - 1];
-        else {
-            int k0 = static_cast<int>(std::floor(s));
-            double frac = s - k0;
-            src = (1.0 - frac) * self->dL_dQ_[k0] + frac * self->dL_dQ_[k0 + 1];
+        const double s = (t - self->record_t0_) / dt - 1.0;
+        for (const auto& gs : self->gauge_sources_) {
+            const std::vector<double>& dq = gs.second;
+            const int M = static_cast<int>(dq.size());
+            if (M == 0) continue;
+            double src;
+            if (s <= 0.0) src = dq[0];
+            else if (s >= M - 1) src = dq[M - 1];
+            else {
+                int k0 = static_cast<int>(std::floor(s));
+                double frac = s - k0;
+                src = (1.0 - frac) * dq[k0] + frac * dq[k0 + 1];
+            }
+            lambda_dot[gs.first] -= src / dt;   // inject this gauge's running-cost source
         }
-        lambda_dot[self->gauge_state_idx_] -= src / dt;
     }
     if (self->config_.verbose) {
         static int cnt = 0;
@@ -1140,37 +1164,59 @@ inline void SaintVenantEnzyme::stop_recording() {
     recording_ = false;
 }
 
-inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id, 
-                                                  const std::vector<double>& dL_dQ) {
+inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id,
+                                                 const std::vector<double>& dL_dQ) {
+    // Single-gauge convenience wrapper around the multi-gauge entry point.
+    compute_gradients_multigauge(std::vector<int>{gauge_reach_id},
+                                 std::vector<std::vector<double>>{dL_dQ});
+}
+
+inline void SaintVenantEnzyme::compute_gradients_multigauge(
+    const std::vector<int>& gauge_reach_ids,
+    const std::vector<std::vector<double>>& dL_dQ_per_gauge) {
 #ifdef DMC_ENABLE_SUNDIALS
     if (recorded_times_.empty()) {
         std::cerr << "No recorded outputs for gradient computation" << std::endl;
         return;
     }
-    
-    if (dL_dQ.size() != recorded_times_.size()) {
-        std::cerr << "dL_dQ size (" << dL_dQ.size() << ") doesn't match recorded times ("
-                  << recorded_times_.size() << ")" << std::endl;
+    if (gauge_reach_ids.size() != dL_dQ_per_gauge.size()) {
+        std::cerr << "gauge count (" << gauge_reach_ids.size() << ") != dL_dQ series count ("
+                  << dL_dQ_per_gauge.size() << ")" << std::endl;
         return;
     }
-    
-    // Find gauge reach index
-    int gauge_idx = -1;
+
+    // Resolve every gauge reach to its outlet-Q state index and stage the running-cost sources.
     const auto& topo_order = network_.topological_order();
-    for (int i = 0; i < n_reaches_; ++i) {
-        if (topo_order[i] == gauge_reach_id) {
-            gauge_idx = i;
-            // Index of outlet Q in state vector
-            gauge_state_idx_ = reach_state_offset_[i] + 2*(n_nodes_-1) + 1;
-            break;
+    gauge_sources_.clear();
+    for (size_t gi = 0; gi < gauge_reach_ids.size(); ++gi) {
+        if (dL_dQ_per_gauge[gi].size() != recorded_times_.size()) {
+            std::cerr << "dL_dQ[" << gi << "] size (" << dL_dQ_per_gauge[gi].size()
+                      << ") doesn't match recorded times (" << recorded_times_.size() << ")" << std::endl;
+            return;
         }
+        int idx = -1;
+        for (int i = 0; i < n_reaches_; ++i) {
+            if (topo_order[i] == gauge_reach_ids[gi]) {
+                idx = reach_state_offset_[i] + 2*(n_nodes_-1) + 1;  // outlet Q state index
+                break;
+            }
+        }
+        if (idx < 0) {
+            std::cerr << "Gauge reach " << gauge_reach_ids[gi] << " not found" << std::endl;
+            return;
+        }
+        gauge_sources_.emplace_back(idx, dL_dQ_per_gauge[gi]);
     }
-    
-    if (gauge_idx < 0) {
-        std::cerr << "Gauge reach " << gauge_reach_id << " not found" << std::endl;
-        return;
-    }
-    
+    gauge_state_idx_ = gauge_sources_.empty() ? -1 : gauge_sources_[0].first;  // verbose dump only
+
+    run_adjoint_backward();
+#else
+    std::cerr << "SUNDIALS required for adjoint gradient computation" << std::endl;
+#endif
+}
+
+#ifdef DMC_ENABLE_SUNDIALS
+inline void SaintVenantEnzyme::run_adjoint_backward() {
     // Initialize adjoint state: λ(T) = ∂L/∂y(T)
     // Only the gauge Q component is non-zero
     yB_ = N_VNew_Serial(total_state_size_, sunctx_);
@@ -1218,10 +1264,9 @@ inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id,
         return;
     }
     
-    // Store the per-observation loss gradient; the adjoint RHS consumes it as a continuous
-    // running-cost source (see adjoint_rhs_callback). Terminal condition is therefore
-    // λ(T) = 0 -- ALL observations (including the one at t_final) enter via the source term.
-    dL_dQ_ = dL_dQ;
+    // The per-gauge running-cost sources (gauge_sources_) are consumed by adjoint_rhs_callback.
+    // Terminal condition is λ(T) = 0 -- ALL observations (including the one at t_final, across
+    // every gauge) enter via the source term.
     N_VConst(0.0, yB_);
 
     flag = CVodeInitB(cvode_mem_, indexB_, adjoint_rhs_callback, t_final, yB_);
@@ -1294,11 +1339,8 @@ inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id,
     if (config_.verbose) {
         std::cout << "  Gradients computed via CVODES adjoint + Enzyme" << std::endl;
     }
-
-#else
-    std::cerr << "SUNDIALS required for adjoint gradient computation" << std::endl;
-#endif
 }
+#endif // DMC_ENABLE_SUNDIALS
 
 inline std::unordered_map<std::string, double> SaintVenantEnzyme::get_gradients() const {
     std::unordered_map<std::string, double> grads;

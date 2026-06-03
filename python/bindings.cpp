@@ -1551,6 +1551,18 @@ static double routing_objective(
                  dL_dQ: Gradient of loss w.r.t. Q at each recorded time
              )doc",
              py::arg("gauge_reach_id"), py::arg("dL_dQ"))
+         .def("compute_gradients_multigauge", &SaintVenantEnzyme::compute_gradients_multigauge,
+             R"doc(
+             Multi-gauge adjoint gradient in a SINGLE backward solve.
+
+             Loss L = sum_g sum_k l_{g,k}(Q_g(t_k)) over several gauges; each gauge's running-cost
+             source is injected into one CVodeB, so the cost is one gradient (not one-per-gauge).
+
+             Args:
+                 gauge_reach_ids: list of reach IDs of the gauges
+                 dL_dQ_per_gauge: list (per gauge) of dL/dQ_g at each recorded time
+             )doc",
+             py::arg("gauge_reach_ids"), py::arg("dL_dQ_per_gauge"))
          .def("get_gradients", &SaintVenantEnzyme::get_gradients,
              "Get accumulated gradients as dict")
          .def("reset_gradients", &SaintVenantEnzyme::reset_gradients,
