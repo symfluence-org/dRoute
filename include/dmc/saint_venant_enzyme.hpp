@@ -164,7 +164,28 @@ private:
     std::vector<ReachState> reach_states_;
     std::vector<SVEGeometry> reach_geometry_;
     std::vector<double> lateral_inflows_;  // [m³/s] per reach
-    
+
+    // Lake configuration per reach. Inline lakes (is_lake) replace the channel PDE with a
+    // storage-discharge node; channel reaches may carry a subgrid (off-network) lake store that
+    // attenuates lateral inflow. Both stores are integrated as extra ODE states inside the CVODES
+    // system (lake_state / subgrid_state index into the state vector, appended after the channel
+    // states), so the implicit solve and the adjoint see them. Rating params mirror the MC router
+    // (route_lake/apply_subgrid_lake). For now the rating params are constants read here (lake
+    // PARAMETER gradients come in a later phase); the lake STATES are fully differentiated.
+    struct SVELake {
+        bool is_lake = false;
+        double storage_max = 1.0, s_dead = 0.0;
+        double q_ref = 0.0, exp = 1.5, q_min = 0.0, spill_coef = 1.0;
+        bool has_subgrid = false;
+        double subgrid_frac = 0.0, subgrid_storage_max = 1.0, subgrid_q_ref = 0.0, subgrid_exp = 1.0;
+        int lake_state = -1;       // state index of the inline lake storage S (-1 if not a lake)
+        int subgrid_state = -1;    // state index of the subgrid store S_sub (-1 if none)
+        double init_storage = 0.0, init_subgrid_storage = 0.0;
+        double storage = 0.0, subgrid_storage = 0.0;   // current values (pack/unpack with y)
+    };
+    std::vector<SVELake> reach_lake_;
+    bool has_lakes_ = false;
+
     // State vector mapping
     std::vector<int> reach_state_offset_;
     int total_state_size_ = 0;
@@ -347,8 +368,7 @@ inline SaintVenantEnzyme::SaintVenantEnzyme(Network& network, SaintVenantEnzymeC
         reach_states_[i].resize(n_nodes_);
         offset += 2 * n_nodes_;  // A and Q for each node
     }
-    total_state_size_ = offset;
-    
+
     // Initialize geometry from network reaches
     const auto& topo_order = network_.topological_order();
     for (int i = 0; i < n_reaches_; ++i) {
@@ -358,7 +378,40 @@ inline SaintVenantEnzyme::SaintVenantEnzyme(Network& network, SaintVenantEnzymeC
         reach_geometry_[i].width_coef = to_double(reach.geometry.width_coef);
         reach_geometry_[i].width_exp = to_double(reach.geometry.width_exp);
     }
-    
+
+    // Lake configuration + extra storage states (appended after all channel states).
+    reach_lake_.assign(n_reaches_, SVELake());
+    for (int i = 0; i < n_reaches_; ++i) {
+        const Reach& reach = network_.get_reach(topo_order[i]);
+        SVELake& L = reach_lake_[i];
+        if (reach.is_lake) {
+            L.is_lake = true; has_lakes_ = true;
+            L.storage_max = reach.storage_max > 0.0 ? reach.storage_max : 1.0;
+            L.s_dead = to_double(reach.lake_s_dead);
+            L.q_ref = to_double(reach.lake_q_ref);
+            L.exp = to_double(reach.lake_exp) > 0.0 ? to_double(reach.lake_exp) : 1.5;
+            L.q_min = to_double(reach.lake_q_min);
+            L.spill_coef = to_double(reach.lake_spill_coef) > 0.0 ? to_double(reach.lake_spill_coef) : 1.0;
+            // start at the active storage that releases ~q_ref (frac=1 -> full), or current state
+            L.init_storage = to_double(reach.storage) > 0.0 ? to_double(reach.storage) : L.storage_max;
+            L.lake_state = offset++;
+        }
+        if (reach.has_subgrid_lake) {
+            L.has_subgrid = true; has_lakes_ = true;
+            L.subgrid_frac = reach.subgrid_lake_frac;
+            L.subgrid_storage_max = reach.subgrid_storage_max > 0.0 ? reach.subgrid_storage_max : 1.0;
+            L.subgrid_q_ref = to_double(reach.subgrid_q_ref);
+            L.subgrid_exp = to_double(reach.subgrid_exp) > 0.0 ? to_double(reach.subgrid_exp) : 1.0;
+            L.init_subgrid_storage = to_double(reach.subgrid_storage);
+            L.subgrid_state = offset++;
+        }
+    }
+    total_state_size_ = offset;
+
+    // The graph-colored Jacobian sparsity does not yet include the lake-storage couplings;
+    // fall back to the dense Jacobian (always correct) whenever lakes are present.
+    if (has_lakes_) config_.use_colored_jacobian = false;
+
     // Initialize state
     initialize_state();
     
@@ -846,6 +899,11 @@ inline void SaintVenantEnzyme::initialize_state() {
             reach_states_[i].Q[j] = Q0;
         }
     }
+    // Initialize lake/subgrid storage states.
+    for (int i = 0; i < n_reaches_; ++i) {
+        reach_lake_[i].storage = reach_lake_[i].init_storage;
+        reach_lake_[i].subgrid_storage = reach_lake_[i].init_subgrid_storage;
+    }
 }
 
 inline void SaintVenantEnzyme::pack_state(double* y) const {
@@ -855,6 +913,8 @@ inline void SaintVenantEnzyme::pack_state(double* y) const {
             y[off + 2*j] = reach_states_[i].A[j];
             y[off + 2*j + 1] = reach_states_[i].Q[j];
         }
+        if (reach_lake_[i].lake_state >= 0) y[reach_lake_[i].lake_state] = reach_lake_[i].storage;
+        if (reach_lake_[i].subgrid_state >= 0) y[reach_lake_[i].subgrid_state] = reach_lake_[i].subgrid_storage;
     }
 }
 
@@ -865,7 +925,38 @@ inline void SaintVenantEnzyme::unpack_state(const double* y) {
             reach_states_[i].A[j] = std::max(y[off + 2*j], config_.min_area);
             reach_states_[i].Q[j] = y[off + 2*j + 1];
         }
+        if (reach_lake_[i].lake_state >= 0)
+            reach_lake_[i].storage = std::max(y[reach_lake_[i].lake_state], 0.0);
+        if (reach_lake_[i].subgrid_state >= 0)
+            reach_lake_[i].subgrid_storage = std::max(y[reach_lake_[i].subgrid_state], 0.0);
     }
+}
+
+// Inline lake/reservoir storage-discharge rating Q(S), mirroring the MC router's route_lake but
+// in continuous (ODE) form for CVODES: Q = q_min + (q_ref-q_min)*frac^exp + spill, with
+// frac = clamp((S-Sdead)/(Smax-Sdead), 0, 1) and spill = spill_coef*max(S-Smax,0)/dt. Free
+// function so Enzyme differentiates it through the call (active argument: S). All other args are
+// rating params (constants in the current forward/state phase; routed through params[] later for
+// lake-parameter gradients).
+inline double sve_lake_rating(double S, double Smax, double Sdead, double q_min, double q_ref,
+                              double expn, double spill_coef, double dt) {
+    double denom = (Smax - Sdead) > 1.0 ? (Smax - Sdead) : 1.0;
+    double frac = (S - Sdead) / denom;
+    frac = frac < 0.0 ? 0.0 : (frac > 1.0 ? 1.0 : frac);
+    double fr = frac < 1e-12 ? 1e-12 : frac;     // floor keeps pow() derivative finite at S=Sdead
+    double release = q_min + (q_ref - q_min) * std::pow(fr, expn);
+    double over = (S - Smax) > 0.0 ? (S - Smax) : 0.0;
+    double Q = release + spill_coef * over / dt;
+    return Q > 0.0 ? Q : 0.0;
+}
+
+// Subgrid (off-network) lake store rating Q(S) = q_ref * frac^exp, frac = clamp(S/Smax, 0, 1).
+inline double sve_subgrid_rating(double S, double Smax, double q_ref, double expn) {
+    double fr = S / (Smax > 1.0 ? Smax : 1.0);
+    fr = fr < 0.0 ? 0.0 : (fr > 1.0 ? 1.0 : fr);
+    double frp = fr < 1e-12 ? 1e-12 : fr;
+    double Q = q_ref * std::pow(frp, expn);
+    return Q > 0.0 ? Q : 0.0;
 }
 
 inline void SaintVenantEnzyme::compute_rhs(double t, const double* y, double* ydot) {
@@ -902,45 +993,62 @@ inline void SaintVenantEnzyme::compute_rhs_with_params(
     // Process each reach
     for (int r = 0; r < n_reaches_; ++r) {
         const Reach& reach = network_.get_reach(topo_order[r]);
-        SVEGeometry geom = reach_geometry_[r];
-        // NOTE: do NOT route the active parameter through geom.manning_n -- Enzyme drops the
-        // tangent through this struct member (geom is copied from an enzyme_const member).
-        // Instead pass params[r] directly into friction_slope below. geom.manning_n is left
-        // as-is and only used by the non-differentiated friction_slope(Q,A,R) overload, which
-        // we no longer call on this path.
-        const double manning_r = params[r];  // active parameter, flows straight into Sf
-
-        double dx = reach.length / (n_nodes_ - 1);
+        const SVELake& Lk = reach_lake_[r];
         int off = reach_state_offset_[r];
 
         double lat_r = use_hist ? lateral_history_[lstep][r] : lateral_inflows_[r];
-        // Lateral inflow as a source DENSITY (per unit length) on dA/dt. The reach is
-        // discretized as n_nodes cells each of width dx (= length/(n_nodes-1)), so q_lat is
-        // added at all n_nodes nodes and integrates to q_lat * n_nodes * dx. To inject
-        // exactly lat_r we must divide by (n_nodes*dx), NOT by reach.length -- the latter
-        // over-injects by n_nodes/(n_nodes-1) (e.g. 4/3 for n_nodes=4), the residual mass
-        // leak after removing the inlet double-count (single reach 100 in -> 133 out).
-        double q_lat = lat_r / (n_nodes_ * dx);
-        
-        // Upstream boundary: sum of upstream reach outflows
+
+        // Upstream boundary: sum of upstream-reach EFFECTIVE outflows. A lake upstream releases
+        // its rating Q(S_u) (from the lake-storage state), not its channel outlet node.
         double Q_upstream = 0.0;
         Junction& up_junc = network_.get_junction(reach.upstream_junction_id);
         for (int up_reach_id : up_junc.upstream_reach_ids) {
             for (int ur = 0; ur < n_reaches_; ++ur) {
                 if (topo_order[ur] == up_reach_id) {
-                    int up_off = reach_state_offset_[ur];
-                    Q_upstream += y[up_off + 2*(n_nodes_-1) + 1];
+                    const SVELake& Lu = reach_lake_[ur];
+                    if (Lu.is_lake) {
+                        Q_upstream += sve_lake_rating(y[Lu.lake_state], Lu.storage_max, Lu.s_dead,
+                                                      Lu.q_min, Lu.q_ref, Lu.exp, Lu.spill_coef, config_.dt);
+                    } else {
+                        Q_upstream += y[reach_state_offset_[ur] + 2*(n_nodes_-1) + 1];
+                    }
                     break;
                 }
             }
         }
-        // NOTE: do NOT add lateral inflow here. lat_r is already injected in full as the
-        // distributed source q_lat (see above) on dA/dt at every node, which integrates
-        // (via continuity dA/dt = -dQ/dx + q_lat) to exactly lat_r of added volume over the
-        // reach. The old `Q_upstream += lat_r*0.5` double-counted it as an extra inlet flux
-        // (proven non-conservative: a single reach with constant 100 m^3/s in settled to
-        // ~183 out), which compounded into a ~660x blow-up on the cascaded Calgary network.
-        // The inlet flux is purely the sum of upstream-reach outflows.
+
+        // ---- Inline lake/reservoir: storage node, not a channel. Freeze the channel states and
+        // integrate dS/dt = I - Q(S); downstream reaches read Q(S) via the loop above. ----
+        if (Lk.is_lake) {
+            for (int j = 0; j < n_nodes_; ++j) { ydot[off + 2*j] = 0.0; ydot[off + 2*j + 1] = 0.0; }
+            double Qout = sve_lake_rating(y[Lk.lake_state], Lk.storage_max, Lk.s_dead,
+                                          Lk.q_min, Lk.q_ref, Lk.exp, Lk.spill_coef, config_.dt);
+            ydot[Lk.lake_state] = (Q_upstream + lat_r) - Qout;   // dS/dt = I - Q(S)
+            continue;
+        }
+
+        // ---- Channel reach: optional subgrid lake attenuation of the lateral inflow. A fraction
+        // subgrid_frac of lat_r flows through an aggregate store (its own ODE state); the channel
+        // sees direct + store-outflow. ----
+        double eff_lat = lat_r;
+        if (Lk.has_subgrid) {
+            double to_lake = Lk.subgrid_frac * lat_r;
+            double Qsub = sve_subgrid_rating(y[Lk.subgrid_state], Lk.subgrid_storage_max,
+                                             Lk.subgrid_q_ref, Lk.subgrid_exp);
+            ydot[Lk.subgrid_state] = to_lake - Qsub;            // dS_sub/dt = to_lake - Q(S_sub)
+            eff_lat = (lat_r - to_lake) + Qsub;
+        }
+
+        SVEGeometry geom = reach_geometry_[r];
+        // NOTE: do NOT route the active parameter through geom.manning_n -- Enzyme drops the
+        // tangent through this struct member (geom is copied from an enzyme_const member).
+        const double manning_r = params[r];  // active parameter, flows straight into Sf
+
+        double dx = reach.length / (n_nodes_ - 1);
+        // Lateral inflow as a source DENSITY (per unit length): added at all n_nodes nodes, each a
+        // dx=length/(n_nodes-1) cell, so divide by (n_nodes*dx) to inject exactly eff_lat (see the
+        // mass-conservation fix). Upstream inflow enters purely as the inlet flux below.
+        double q_lat = eff_lat / (n_nodes_ * dx);
 
         // Interior nodes
         for (int j = 0; j < n_nodes_; ++j) {
@@ -1104,6 +1212,10 @@ inline double SaintVenantEnzyme::get_discharge(int reach_id) const {
     const auto& topo_order = network_.topological_order();
     for (int i = 0; i < n_reaches_; ++i) {
         if (topo_order[i] == reach_id) {
+            const SVELake& Lk = reach_lake_[i];
+            if (Lk.is_lake)   // lake outlet = storage-discharge rating, not the channel node
+                return sve_lake_rating(Lk.storage, Lk.storage_max, Lk.s_dead, Lk.q_min,
+                                       Lk.q_ref, Lk.exp, Lk.spill_coef, config_.dt);
             return reach_states_[i].Q.back();
         }
     }
@@ -1111,9 +1223,13 @@ inline double SaintVenantEnzyme::get_discharge(int reach_id) const {
 }
 
 inline std::vector<double> SaintVenantEnzyme::get_all_discharges() const {
-    std::vector<double> result;
-    for (const auto& state : reach_states_) {
-        result.push_back(state.Q.back());
+    std::vector<double> result(n_reaches_);
+    for (int i = 0; i < n_reaches_; ++i) {
+        const SVELake& Lk = reach_lake_[i];
+        result[i] = Lk.is_lake
+            ? sve_lake_rating(Lk.storage, Lk.storage_max, Lk.s_dead, Lk.q_min,
+                              Lk.q_ref, Lk.exp, Lk.spill_coef, config_.dt)
+            : reach_states_[i].Q.back();
     }
     return result;
 }
