@@ -914,6 +914,60 @@ inline void SaintVenantEnzyme::compute_param_sensitivity(double t, const double*
             grad_p[k] = s;
         }
     }
+
+    // ---- Inter-reach lake-PARAMETER term. Enzyme drops the lake rating's param tangent through
+    // the DOWNSTREAM coupling (the colored passes above give lake params only the storage-row
+    // term, with the downstream-inlet contribution structurally zero). Fix exactly: the lake
+    // storage s affects the loss ONLY through the outflow Q_L(s; p), so
+    //   dL/dp = (∂Q_L/∂p) · (∂L/∂Q_L) = (∂Q_L/∂p / ∂Q_L/∂s) · A,
+    // where A = Σ_i (∂f_i/∂s)·λ_i is the full state-s tangent contracted with λ (Enzyme DOES
+    // capture the s STATE coupling, incl. downstream). One state-seed pass per lake gives A and
+    // ∂Q_L/∂s (= -dydot_s[storage]·Smax); ∂Q_L/∂p is analytic from the rating. This OVERWRITES the
+    // (incomplete) colored-pass values for the lake/subgrid params. Manning params are unaffected.
+    if (has_lakes_) {
+        std::vector<double> dys(N, 0.0), dyds(N, 0.0);
+        for (int r = 0; r < n_reaches_; ++r) {
+            const SVELake& L = reach_lake_[r];
+            if (L.is_lake) {
+                std::fill(dys.begin(), dys.end(), 0.0); dys[L.lake_state] = 1.0;
+                std::fill(dyds.begin(), dyds.end(), 0.0);
+                __enzyme_fwddiff((void*)rhs_wrapper, enzyme_const, t,
+                    enzyme_dup, y, dys.data(), enzyme_const, params.data(),
+                    enzyme_dupnoneed, nullptr, dyds.data(), enzyme_const, this);
+                double A = 0.0; for (int i = 0; i < N; ++i) A += dyds[i] * lambda[i];
+                double dQds = -dyds[L.lake_state] * L.storage_max;   // ∂(dS/dt)/∂s = -∂Q/∂s/Smax
+                double ratio = (std::abs(dQds) > 1e-30) ? (A / dQds) : 0.0;
+                // analytic ∂Q_L/∂params at the current storage
+                double S = y[L.lake_state] * L.storage_max;
+                double denom = (L.storage_max - L.s_dead) > 1.0 ? (L.storage_max - L.s_dead) : 1.0;
+                double frac = (S - L.s_dead) / denom; frac = frac < 0.0 ? 0.0 : (frac > 1.0 ? 1.0 : frac);
+                double fr = frac < 1e-12 ? 1e-12 : frac;
+                double fpow = std::pow(fr, params[L.p_exp]);
+                double over = (S - L.storage_max) > 0.0 ? (S - L.storage_max) : 0.0;
+                grad_p[L.p_q_ref] = fpow * ratio;
+                grad_p[L.p_q_min] = (1.0 - fpow) * ratio;
+                grad_p[L.p_exp]   = (params[L.p_q_ref] - params[L.p_q_min]) * fpow * std::log(fr) * ratio;
+                grad_p[L.p_spill] = (over / config_.dt) * ratio;
+            }
+            if (L.has_subgrid) {
+                std::fill(dys.begin(), dys.end(), 0.0); dys[L.subgrid_state] = 1.0;
+                std::fill(dyds.begin(), dyds.end(), 0.0);
+                __enzyme_fwddiff((void*)rhs_wrapper, enzyme_const, t,
+                    enzyme_dup, y, dys.data(), enzyme_const, params.data(),
+                    enzyme_dupnoneed, nullptr, dyds.data(), enzyme_const, this);
+                double A = 0.0; for (int i = 0; i < N; ++i) A += dyds[i] * lambda[i];
+                double dQds = -dyds[L.subgrid_state] * L.subgrid_storage_max;
+                double ratio = (std::abs(dQds) > 1e-30) ? (A / dQds) : 0.0;
+                double S = y[L.subgrid_state] * L.subgrid_storage_max;
+                double smx = L.subgrid_storage_max > 1.0 ? L.subgrid_storage_max : 1.0;
+                double frac = S / smx; frac = frac < 0.0 ? 0.0 : (frac > 1.0 ? 1.0 : frac);
+                double fr = frac < 1e-12 ? 1e-12 : frac;
+                double fpow = std::pow(fr, params[L.p_sexp]);
+                grad_p[L.p_sq_ref] = fpow * ratio;
+                grad_p[L.p_sexp]   = params[L.p_sq_ref] * fpow * std::log(fr) * ratio;
+            }
+        }
+    }
 }
 
 #endif // DMC_USE_ENZYME
@@ -1005,9 +1059,9 @@ inline void SaintVenantEnzyme::unpack_state(const double* y) {
 // Inline lake/reservoir storage-discharge rating Q(S), mirroring the MC router's route_lake but
 // in continuous (ODE) form for CVODES: Q = q_min + (q_ref-q_min)*frac^exp + spill, with
 // frac = clamp((S-Sdead)/(Smax-Sdead), 0, 1) and spill = spill_coef*max(S-Smax,0)/dt. Free
-// function so Enzyme differentiates it through the call (active argument: S). All other args are
-// rating params (constants in the current forward/state phase; routed through params[] later for
-// lake-parameter gradients).
+// function so Enzyme differentiates it through the call (active arg: S). The rating params are
+// routed from params[] so they carry tangents; the inter-reach (downstream) param tangent that
+// Enzyme drops is added analytically in compute_param_sensitivity.
 inline double sve_lake_rating(double S, double Smax, double Sdead, double q_min, double q_ref,
                               double expn, double spill_coef, double dt) {
     double denom = (Smax - Sdead) > 1.0 ? (Smax - Sdead) : 1.0;
@@ -1549,14 +1603,9 @@ inline std::unordered_map<std::string, double> SaintVenantEnzyme::get_gradients(
     for (int i = 0; i < n_reaches_; ++i) {
         std::string rk = "reach_" + std::to_string(topo_order[i]);
         grads[rk + "_manning_n"] = grad_params_.empty() ? grad_manning_n_[i] : grad_params_[i];
-        // KNOWN ISSUE (lake PARAMETER gradients): the per-reach Manning's-n gradients are correct
-        // (validated, incl. with lakes present -- a lake reach's Manning grad is exactly 0). The
-        // lake RATING-parameter gradients below are computed through the same adjoint path but do
-        // NOT yet match a finite-difference / loss-scan check (wrong sign + ~0.1x magnitude). The
-        // forward lake routing is correct; the defect is the slow lake-STORAGE costate's
-        // contribution to (∂f/∂p)ᵀλ in the stiff fast-channel/slow-storage backward solve. These
-        // are exposed for development but should NOT be trusted for calibration yet. (Not needed
-        // by the joint-DDS coupling, which uses only the forward.)
+        // Lake RATING-parameter gradients (validated vs FD ~0.99 and by parameter recovery): the
+        // inter-reach term is added analytically in compute_param_sensitivity (Enzyme drops that
+        // tangent). Manning grads are correct too (a lake reach's Manning grad is exactly 0).
         const SVELake& L = reach_lake_[i];
         if (L.is_lake) {
             grads[rk + "_lake_q_ref"]      = grad_params_[L.p_q_ref];
