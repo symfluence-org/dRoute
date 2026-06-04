@@ -430,10 +430,8 @@ inline SaintVenantEnzyme::SaintVenantEnzyme(Network& network, SaintVenantEnzymeC
     total_state_size_ = offset;
     total_params_ = pidx;
     grad_params_.assign(total_params_, 0.0);
-
-    // The graph-colored Jacobian sparsity does not yet include the lake-storage couplings;
-    // fall back to the dense Jacobian (always correct) whenever lakes are present.
-    if (has_lakes_) config_.use_colored_jacobian = false;
+    // The colored-Jacobian sparsity is lake-aware (build_jacobian_sparsity handles the storage
+    // states + inter-reach lake coupling), so coloring stays enabled with lakes present.
 
     // Initialize state
     initialize_state();
@@ -751,22 +749,44 @@ inline void SaintVenantEnzyme::build_jacobian_sparsity() {
     }
 
     auto cidx = [&](int i, int j, int v) { return reach_state_offset_[i] + 2 * j + v; };
+    // Effective-outlet column of a reach: a lake releases via its storage state, a channel via its
+    // outlet-node Q. This is the column whose perturbation changes the reach's downstream inflow.
+    auto outcol = [&](int u) { return reach_lake_[u].is_lake ? reach_lake_[u].lake_state
+                                                             : cidx(u, nn - 1, 1); };
     col_rows_.assign(N, {});
     for (int i = 0; i < n_reaches_; ++i) {
-        for (int j = 0; j < nn; ++j) {
-            for (int v = 0; v < 2; ++v) {
-                int c = cidx(i, j, v);
-                std::vector<int>& rs = col_rows_[c];
-                for (int jp = j - 1; jp <= j + 1; ++jp) {
-                    if (jp < 0 || jp >= nn) continue;
-                    rs.push_back(cidx(i, jp, 0));
-                    rs.push_back(cidx(i, jp, 1));
+        const SVELake& L = reach_lake_[i];
+        if (L.is_lake) {
+            // Inline lake: only the storage state is live; dS/dt depends on S (self). The channel
+            // nodes are frozen (ydot==0) -> their columns affect no rows.
+            col_rows_[L.lake_state].push_back(L.lake_state);
+        } else {
+            // Channel within-reach stencil: column (i,j,v) affects rows (i,j-1),(i,j),(i,j+1).
+            for (int j = 0; j < nn; ++j)
+                for (int v = 0; v < 2; ++v) {
+                    std::vector<int>& rs = col_rows_[cidx(i, j, v)];
+                    for (int jp = j - 1; jp <= j + 1; ++jp) {
+                        if (jp < 0 || jp >= nn) continue;
+                        rs.push_back(cidx(i, jp, 0));
+                        rs.push_back(cidx(i, jp, 1));
+                    }
                 }
-                if (j == nn - 1 && v == 1 && downstream_reach_[i] >= 0) {
-                    int d = downstream_reach_[i];
-                    rs.push_back(cidx(d, 0, 0));
-                    rs.push_back(cidx(d, 0, 1));
-                }
+            // Subgrid store: its state affects its own row and (via eff_lat -> q_lat) reach i's A rows.
+            if (L.has_subgrid) {
+                col_rows_[L.subgrid_state].push_back(L.subgrid_state);
+                for (int j = 0; j < nn; ++j) col_rows_[L.subgrid_state].push_back(cidx(i, j, 0));
+            }
+        }
+        // Inter-reach coupling: this reach's effective outflow feeds its downstream reach's inlet
+        // (a channel's node-0 A,Q rows, or a downstream lake's storage row).
+        int d = downstream_reach_[i];
+        if (d >= 0) {
+            int oc = outcol(i);
+            if (reach_lake_[d].is_lake) {
+                col_rows_[oc].push_back(reach_lake_[d].lake_state);
+            } else {
+                col_rows_[oc].push_back(cidx(d, 0, 0));
+                col_rows_[oc].push_back(cidx(d, 0, 1));
             }
         }
     }
