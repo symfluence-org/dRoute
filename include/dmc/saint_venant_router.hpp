@@ -62,8 +62,12 @@ struct SaintVenantConfig {
     double g = 9.81;                 // Gravitational acceleration [m/s²]
     
     // Numerical parameters
-    double rel_tol = 1e-4;           // Relative tolerance for CVODES
-    double abs_tol = 1e-6;           // Absolute tolerance
+    // Tight tolerances by default: the adjoint/forward-sensitivity gradients require an
+    // accurately-resolved forward trajectory. At the old loose values (1e-4/1e-6) the costate
+    // structure degraded (multi-reach gradients washed toward near-equal values); at 1e-8/1e-10
+    // the adjoint recovers known Manning's-n across multi-reach networks via gradient descent.
+    double rel_tol = 1e-8;           // Relative tolerance for CVODES
+    double abs_tol = 1e-10;          // Absolute tolerance
     int max_steps = 5000;            // Max internal steps per output step
     
     // Initial conditions
@@ -109,7 +113,14 @@ struct SVEGeometry {
     
     // Compute friction slope (Manning)
     inline double friction_slope(double Q, double A, double R) const {
-        double n = manning_n;
+        return friction_slope(Q, A, R, manning_n);
+    }
+
+    // Friction slope with an EXPLICIT Manning's n. Used on the differentiable path so the
+    // active parameter flows directly into the arithmetic: Enzyme's activity analysis was
+    // dropping the tangent when n came from a struct member (geom.manning_n) of a struct
+    // copied from an enzyme_const member, making ∂f/∂n ≈ 0 and the adjoint gradient ~0.
+    inline double friction_slope(double Q, double A, double R, double n) const {
         double v = Q / std::max(A, 0.1);
         // Sf = (n * |v|)² / R^(4/3)
         return n * n * v * std::abs(v) / std::pow(std::max(R, 0.01), 4.0/3.0);
