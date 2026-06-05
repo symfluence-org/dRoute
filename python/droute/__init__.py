@@ -49,7 +49,7 @@ __all__ = getattr(
 def register() -> None:
     """Register dRoute components with symfluence plugin registry."""
     from symfluence.core.registry import model_manifest
-    from .config import DRouteConfigAdapter
+    from .config import DRouteConfig, DRouteConfigAdapter
     from .runner import DRouteRunner
     from .preprocessor import DRoutePreProcessor
     from .postprocessor import DRoutePostProcessor
@@ -61,6 +61,7 @@ def register() -> None:
     model_manifest(
         "DROUTE",
         config_adapter=DRouteConfigAdapter,
+        config_schema=DRouteConfig,
         preprocessor=DRoutePreProcessor,
         runner=DRouteRunner,
         runner_method='run_droute',
