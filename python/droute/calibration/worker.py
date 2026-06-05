@@ -8,6 +8,7 @@ Worker implementation for dRoute routing parameter optimization with support for
 both evolutionary and gradient-based calibration via automatic differentiation.
 """
 
+import json
 import logging
 import os
 import random
@@ -16,7 +17,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -34,23 +35,92 @@ except ImportError:
     HAS_DROUTE = False
     droute = None
 
+# Seconds per day -- used to derive the Saint-Venant sub-step count from the daily routing window.
+DT_DAY = 86400.0
+
+
+def _kge_multigauge(sim: np.ndarray, obs: np.ndarray) -> float:
+    """Per-gauge KGE used by the Saint-Venant multi-gauge objective.
+
+    Matches the validated standalone routing experiment: drops non-finite pairs and requires at
+    least 10 overlapping points. Kept separate from :func:`symfluence.evaluation.metrics.kge`
+    (used by the single-gauge Muskingum-Cunge path) so the SV multi-gauge results stay bit-identical
+    to the standalone driver.
+    """
+    m = np.isfinite(sim) & np.isfinite(obs)
+    s, o = sim[m], obs[m]
+    if len(s) < 10 or o.std() == 0:
+        return np.nan
+    r = np.corrcoef(s, o)[0, 1]
+    return float(1 - np.sqrt((r - 1) ** 2 + (s.std() / o.std() - 1) ** 2 + (s.mean() / o.mean() - 1) ** 2))
+
+
+def build_droute_network(seg_ids, downstream_idx, lengths, slopes, lakes, id_to_idx,
+                         per_reach: Optional[Dict[str, List[float]]] = None):
+    """Build a dRoute Network with Manning's n + inline/subgrid lake config, optionally overriding
+    per-reach routing params from a parameter-manager expansion (``per_reach[param][reach_idx]``).
+
+    Used by the Saint-Venant routing path (transfer-function regionalized parameters expand to one
+    value per reach); the Muskingum-Cunge path builds its network inline in
+    :meth:`DRouteWorker._route_cpp_with_lakes`.
+    """
+    from droute.lake_preprocessor import apply_lake_config_to_network
+    n = len(seg_ids)
+    outlet_junc = n
+    junc_up: Dict[int, List[int]] = {i: [] for i in range(n + 1)}
+    for i in range(n):
+        d = downstream_idx[i]
+        junc_up[d if d >= 0 else outlet_junc].append(i)
+    net = droute.Network()
+    for jid in range(n + 1):
+        j = droute.Junction(); j.id = jid; j.upstream_reach_ids = junc_up[jid]; net.add_junction(j)
+    for i in range(n):
+        r = droute.Reach(); r.id = i; r.length = float(lengths[i]); r.slope = max(float(slopes[i]), 0.001)
+        r.manning_n = 0.035
+        r.upstream_junction_id = i
+        d = downstream_idx[i]; r.downstream_junction_id = d if d >= 0 else outlet_junc
+        net.add_reach(r)
+    net.build_topology()
+    apply_lake_config_to_network(net, lakes, id_to_idx)
+    # per-reach parameter overrides from the regionalized calibration
+    if per_reach:
+        setter = {'manning_n': 'manning_n', 'lake_q_ref': 'lake_q_ref', 'lake_exp': 'lake_exp',
+                  'lake_q_min': 'lake_q_min', 'lake_spill_coef': 'lake_spill_coef',
+                  'subgrid_q_ref': 'subgrid_q_ref', 'subgrid_exp': 'subgrid_exp'}
+        for pname, vals in per_reach.items():
+            attr = setter.get(pname)
+            if attr is None:
+                continue
+            for i in range(n):
+                setattr(net.get_reach(i), attr, float(vals[i]))
+    return net
+
 
 class DRouteWorker(BaseWorker):
     """
     Worker for dRoute routing parameter calibration.
 
-    Supports:
+    Two routing paths, selected by ``DROUTE_ROUTING_METHOD`` (default
+    ``'muskingum_cunge'``):
+
+    Muskingum-Cunge (``'muskingum_cunge'``):
     - Standard evolutionary optimization (evaluate -> route -> metrics)
     - Gradient-based optimization with AD when dRoute is compiled with CoDiPack/Enzyme
     - Efficient in-memory routing (no file I/O during calibration)
+    - Optional inline reservoir operating rules (lakes config)
+    - Single-gauge (outlet) KGE/NSE objective
+    - Lumped calibration parameters: velocity, diffusivity, muskingum_k,
+      muskingum_x, manning_n
 
-    Calibration Parameters:
-        Common routing parameters that can be calibrated:
-        - velocity: Base flow velocity (m/s)
-        - diffusivity: Diffusion coefficient for diffusive wave routing
-        - muskingum_k: Muskingum storage constant
-        - muskingum_x: Muskingum weighting factor
-        - manning_n: Manning's roughness coefficient
+    Saint-Venant + lakes (``'saint_venant'``):
+    - Differentiable Saint-Venant solver with inline + subgrid lake routing
+    - Transfer-function-regionalized per-reach parameters (Manning's n + lake
+      rating coefficients), expanded from a low-dimensional coefficient set by
+      :class:`DRouteParameterManager`
+    - Multi-gauge KGE objective with a per-gauge floor
+    - Coupling-aware: routes the upstream model's fresh runoff each evaluation
+      (``coupling_source_dir``) and supports the dCoupler graph handoff via
+      :meth:`materialize_metric_inputs`
     """
 
     # Default parameter bounds for dRoute calibration
@@ -76,11 +146,14 @@ class DRouteWorker(BaseWorker):
         """
         super().__init__(config, logger)
 
-        # Lazy-loaded components
+        # Lazy-loaded components (Muskingum-Cunge path)
         self._network_config = None
         self._runoff_data = None
         self._observations = None
         self._time_index = None
+
+        # Lazy-loaded components (Saint-Venant + lakes path)
+        self._inp: Optional[Dict[str, Any]] = None  # cached SV inputs (runoff, network arrays, gauges)
 
         # Routing configuration
         self.routing_method = 'muskingum_cunge'
@@ -89,6 +162,17 @@ class DRouteWorker(BaseWorker):
         if config:
             self.routing_method = config.get('DROUTE_ROUTING_METHOD', 'muskingum_cunge')
             self.routing_dt = config.get('DROUTE_ROUTING_DT', 3600)
+
+    def _is_sv(self) -> bool:
+        """True when configured for the Saint-Venant + lakes routing path (multi-gauge,
+        transfer-function regionalized params, coupling-aware). Default is Muskingum-Cunge."""
+        return str(self.routing_method).lower().replace('-', '_') in (
+            'saint_venant', 'saintvenant', 'sv'
+        )
+
+    def _gv(self, key, default=None):
+        """Config accessor used by the Saint-Venant path (dict-key lookup with default)."""
+        return self._get_config_value(lambda: None, default=default, dict_key=key)
 
     def supports_native_gradients(self) -> bool:
         """
@@ -270,6 +354,13 @@ class DRouteWorker(BaseWorker):
         Returns:
             True (always succeeds for dRoute)
         """
+        # Saint-Venant path: expand the regionalized calibration coefficients to per-reach physical
+        # params and write them out for run_model to apply to the network.
+        if self._is_sv():
+            from .parameter_manager import DRouteParameterManager
+            pm = DRouteParameterManager(self.config, self.logger, Path(settings_dir))
+            return pm.update_model_files(params)
+
         self._current_params = params
         return True
 
@@ -292,6 +383,9 @@ class DRouteWorker(BaseWorker):
         Returns:
             True if routing succeeded.
         """
+        if self._is_sv():
+            return self._run_model_sv(config, settings_dir, output_dir, **kwargs)
+
         try:
             if not self._load_data():
                 return False
@@ -544,6 +638,9 @@ class DRouteWorker(BaseWorker):
         Returns:
             Dictionary of metric names to values.
         """
+        if self._is_sv():
+            return self._metrics_sv(output_dir, config, **kwargs)
+
         try:
             routed = getattr(self, '_last_routed', None)
             if routed is None:
@@ -674,6 +771,198 @@ class DRouteWorker(BaseWorker):
         except Exception as e:  # noqa: BLE001 -- calibration resilience
             self.logger.error(f"Error in evaluate_with_gradient: {e}")
             return self.penalty_score, None
+
+    # ===== Saint-Venant + lakes routing path =================================================
+    # Routes SUMMA runoff through the differentiable Saint-Venant solver (inline + subgrid lakes),
+    # applying transfer-function-regionalized per-reach params, scored against a multi-gauge KGE
+    # objective. Coupling-aware: in a coupled run the COUPLED worker passes this iteration's fresh
+    # SUMMA output as ``coupling_source_dir`` so routing reads fresh runoff each evaluation.
+
+    def _load_inputs(self, settings_dir: Path, runoff_file: Optional[str] = None,
+                     force: bool = False) -> Dict[str, Any]:
+        # ``runoff_file`` overrides runoff discovery (coupled runs pass this iteration's fresh SUMMA
+        # output); ``force`` re-reads even when cached, since the runoff changes every coupled eval.
+        if self._inp is not None and not force:
+            return self._inp
+        import glob
+
+        import geopandas as gpd
+        import pandas as pd
+        import xarray as xr
+
+        domain = Path(settings_dir).parent.parent
+        rn_path = self._gv('RIVER_NETWORK_SHAPEFILE') or glob.glob(
+            str(domain / 'shapefiles' / 'river_network' / '*.shp'))[0]
+        rn = gpd.read_file(rn_path)
+        seg_ids = rn['LINKNO'].astype(int).values
+        id_to_idx = {int(s): i for i, s in enumerate(seg_ids)}
+        downstream_idx = np.array([id_to_idx.get(int(d), -1) for d in rn['DSLINKNO'].astype(int).values])
+        lengths = rn['Length'].astype(float).values
+        slopes = rn['Slope'].astype(float).values
+
+        runoff_path = runoff_file or self._gv('DROUTE_RUNOFF_FILE')
+        if not runoff_path:
+            runoff_path = glob.glob(str(domain / 'simulations' / '*' / 'SUMMA' / '*_timestep.nc'))[0]
+        ds = xr.open_dataset(runoff_path)
+        runoff = np.clip(ds['averageRoutedRunoff'].values, 0, None)
+        gru = ds['gruId'].values.astype(int)
+        time = pd.to_datetime(ds['time'].values)
+        attr = xr.open_dataset(domain / 'settings' / 'SUMMA' / 'attributes.nc')
+        area_by_id = {int(h): float(a) for h, a in zip(attr['hruId'].values.astype(int),
+                                                       attr['HRUarea'].values.astype(float))}
+        n_seg = len(seg_ids)
+        seg_runoff = np.zeros((len(time), n_seg))
+        for jx, gid in enumerate(gru):
+            i = id_to_idx.get(int(gid))
+            if i is not None:
+                seg_runoff[:, i] = runoff[:, jx] * area_by_id.get(int(gid), 0.0)
+        cap = float(self._gv('DROUTE_RUNOFF_CAP', 50.0))
+        daily = pd.DataFrame(np.clip(seg_runoff, 0, cap), index=time).resample('D').mean()
+        route_start = self._gv('DROUTE_ROUTE_START', '2010-01-01')
+        eval_start = self._gv('CALIBRATION_PERIOD_START', '2011-01-01')
+        eval_end = self._gv('CALIBRATION_PERIOD_END', '2012-12-31')
+        daily = daily.loc[route_start:eval_end]
+
+        import yaml
+        lf = Path(settings_dir) / 'droute_lakes.yaml'
+        raw = yaml.safe_load(open(lf, encoding='utf-8')) if lf.exists() else {}
+        lakes = {'inline': (raw or {}).get('inline_lakes', {}) or {},
+                 'subgrid': (raw or {}).get('subgrid_lakes', {}) or {}}
+
+        # gauges from the mapping CSV (station, seg) + WSC daily obs
+        obs_dir = self._gv('MULTI_GAUGE_OBS_DIR') or str(domain / 'observations' / 'streamflow')
+        gmap = pd.read_csv(Path(obs_dir) / 'gauge_seg_mapping.csv')
+        i_eval0 = int(np.argmax(daily.index >= pd.Timestamp(eval_start)))
+        rec_dates = daily.index[i_eval0:]
+        gauges = []
+        for _, row in gmap.iterrows():
+            seg = int(row['seg']); ridx = id_to_idx.get(seg)
+            if ridx is None:
+                continue
+            o = pd.read_csv(Path(obs_dir) / f"wsc_{row['station']}_daily.csv",
+                            parse_dates=['date']).set_index('date')['q_cms'].reindex(rec_dates).values
+            if np.isfinite(o).sum() >= 10:
+                gauges.append({'station': str(row['station']), 'ridx': int(ridx), 'obs': o.astype(float)})
+
+        self._inp = dict(seg_ids=seg_ids, id_to_idx=id_to_idx, downstream_idx=downstream_idx,
+                         lengths=lengths, slopes=slopes, daily=daily.values, dates=daily.index,
+                         i_eval0=i_eval0, lakes=lakes, gauges=gauges, rn_path=rn_path)
+        return self._inp
+
+    def _run_model_sv(self, config: Dict[str, Any], settings_dir: Path, output_dir: Path, **kwargs) -> bool:
+        # In a coupled run the COUPLED worker passes the upstream (land) model's fresh output dir as
+        # ``coupling_source_dir``; route THAT iteration's SUMMA runoff rather than a stale project file.
+        runoff_file = None
+        csd = kwargs.get('coupling_source_dir')
+        if csd:
+            import glob
+            cands = (sorted(glob.glob(str(Path(csd) / '**' / '*_timestep.nc'), recursive=True)) or
+                     sorted(glob.glob(str(Path(csd) / '*_timestep.nc'))))
+            if cands:
+                runoff_file = cands[0]
+            else:
+                self.logger.error(f"coupling_source_dir {csd} has no *_timestep.nc SUMMA output")
+                return False
+        inp = self._load_inputs(Path(settings_dir), runoff_file=runoff_file, force=bool(runoff_file))
+        per_reach = None
+        pf = Path(settings_dir) / 'droute_routing_params.json'
+        if pf.exists():
+            per_reach = json.load(open(pf))['params']
+        net = build_droute_network(inp['seg_ids'], inp['downstream_idx'], inp['lengths'],
+                                   inp['slopes'], inp['lakes'], inp['id_to_idx'], per_reach)
+        dt_h = float(self._gv('DROUTE_ROUTING_DT_HOURS', 12.0))
+        sub = int(round(DT_DAY / (dt_h * 3600.0)))
+        c = droute.SaintVenantEnzymeConfig()
+        c.dt = dt_h * 3600.0; c.n_nodes = int(self._gv('DROUTE_SV_NODES', 4))
+        c.enable_adjoint = False; c.use_enzyme_adjoint = False
+        rt = droute.SaintVenantEnzyme(net, c)
+        order = np.asarray(net.topological_order(), dtype=int)
+        runoff = inp['daily']; i0 = inp['i_eval0']; ndays = runoff.shape[0]
+        import contextlib
+        import io
+        gauges = inp['gauges']
+        Qd: Dict[int, List[float]] = {g['ridx']: [] for g in gauges}
+        with contextlib.redirect_stderr(io.StringIO()):
+            for d in range(ndays):
+                for s in range(sub):
+                    for idx in order:
+                        rt.set_lateral_inflow(int(idx), float(runoff[d, idx]))
+                    rt.route_timestep()
+                if d >= i0:
+                    for g in gauges:
+                        Qd[g['ridx']].append(rt.get_discharge(g['ridx']))
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        np.savez(Path(output_dir) / 'droute_streamflow.npz',
+                 ridx=np.array([g['ridx'] for g in gauges]),
+                 stations=np.array([g['station'] for g in gauges]),
+                 Q=np.array([Qd[g['ridx']] for g in gauges]),
+                 obs=np.array([g['obs'] for g in gauges]))
+        return True
+
+    def materialize_metric_inputs(self, graph_outputs: Dict[str, Any], output_dir: Path,
+                                  settings_dir: Path, config: Dict[str, Any]) -> bool:
+        """Graph->metrics handoff: turn the dCoupler routing-component discharge tensor into the
+        per-gauge ``droute_streamflow.npz`` that :meth:`calculate_metrics` reads.
+
+        The dCoupler graph emits raw flux tensors (``{component: {flux: tensor}}``); the routing
+        component's ``discharge`` is ``[n_days, n_reach]`` (m^3/s) over the full routed window. This
+        slices the evaluation window + the gauge reaches (reusing the same gauge/obs metadata and
+        spin-up offset as the standalone routing run) so the objective is computed identically
+        whether routing ran via the in-memory graph or the sequential file path.
+        """
+        discharge = self._extract_discharge(graph_outputs)
+        if discharge is None:
+            self.logger.error("dCoupler graph outputs contained no 'discharge' flux; "
+                              "cannot materialize dRoute metric inputs")
+            return False
+        inp = self._load_inputs(Path(settings_dir))
+        i0 = int(inp['i_eval0'])
+        gauges = inp['gauges']
+        n_eval = discharge.shape[0] - i0
+        if n_eval <= 0:
+            self.logger.error(f"Routed discharge ({discharge.shape[0]} days) shorter than the "
+                              f"spin-up offset ({i0}); cannot evaluate")
+            return False
+        Q = np.array([discharge[i0:i0 + n_eval, g['ridx']] for g in gauges])
+        obs = np.array([g['obs'][:n_eval] for g in gauges])
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        np.savez(Path(output_dir) / 'droute_streamflow.npz',
+                 ridx=np.array([g['ridx'] for g in gauges]),
+                 stations=np.array([g['station'] for g in gauges]),
+                 Q=Q, obs=obs)
+        return True
+
+    @staticmethod
+    def _extract_discharge(graph_outputs: Dict[str, Any]) -> Optional[np.ndarray]:
+        """Pull the [n_days, n_reach] discharge array out of the graph outputs (prefer 'routing')."""
+        def _to_np(t):
+            return t.detach().cpu().numpy() if hasattr(t, 'detach') else np.asarray(t)
+        if not isinstance(graph_outputs, dict):
+            return None
+        for key in ('routing', 'droute', 'DROUTE'):
+            comp = graph_outputs.get(key)
+            if isinstance(comp, dict) and 'discharge' in comp:
+                return _to_np(comp['discharge'])
+        for comp in graph_outputs.values():
+            if isinstance(comp, dict) and 'discharge' in comp:
+                return _to_np(comp['discharge'])
+        return None
+
+    def _metrics_sv(self, output_dir: Path, config: Dict[str, Any], **kwargs) -> Dict[str, Any]:
+        z = np.load(Path(output_dir) / 'droute_streamflow.npz', allow_pickle=True)
+        Q, obs, stations = z['Q'], z['obs'], z['stations']
+        floor = float(self._gv('MULTI_GAUGE_KGE_FLOOR', -2.0))
+        per = {}
+        kept = []
+        for i, st in enumerate(stations):
+            k = _kge_multigauge(Q[i], obs[i])
+            per[f'KGE_{st}'] = k
+            if np.isfinite(k) and k >= floor:   # drop volume-biased gauges routing can't fit
+                kept.append(k)
+        mean_kge = float(np.mean(kept)) if kept else floor
+        per['KGE'] = mean_kge
+        per['calib_score'] = mean_kge   # maximization objective
+        return per
 
     @staticmethod
     def evaluate_worker_function(task_data: Dict[str, Any]) -> Dict[str, Any]:

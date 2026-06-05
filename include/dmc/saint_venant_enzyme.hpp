@@ -67,6 +67,13 @@ struct SaintVenantEnzymeConfig : public SaintVenantConfig {
     bool use_enzyme_jacobian = true;      // Use Enzyme for Jacobian (vs FD)
     bool use_enzyme_adjoint = true;       // Use Enzyme for adjoint RHS
 
+    // Sparse-coloring options. The SV Jacobian is structurally sparse (each state couples only
+    // to its reach's node-neighbours plus the outlet-Q -> downstream-inlet link), so a
+    // graph-colored forward-mode Enzyme sweep builds it in O(#colors) passes (~7) instead of
+    // O(state size) (~hundreds-thousands) -- dimension-independent cost. Set false to fall back
+    // to the dense column-by-column Jacobian (validation reference).
+    bool use_colored_jacobian = true;
+
     // Debug options
     bool verbose = false;                 // Print debug information during initialization
 };
@@ -119,7 +126,18 @@ public:
      * @param dL_dQ           Gradient of loss w.r.t. Q at each recorded time [n_times]
      */
     void compute_gradients(int gauge_reach_id, const std::vector<double>& dL_dQ);
-    
+
+    /**
+     * Multi-gauge gradient: loss L = sum_g sum_k l_{g,k}(Q_g(t_k)) over several gauges.
+     * Injects every gauge's running-cost source into a SINGLE backward solve (one CVodeB),
+     * so the cost is that of one gradient, not one-per-gauge.
+     *
+     * @param gauge_reach_ids  reach IDs of the gauges
+     * @param dL_dQ_per_gauge  per gauge, dL/dQ_g at each recorded time [n_gauges][n_times]
+     */
+    void compute_gradients_multigauge(const std::vector<int>& gauge_reach_ids,
+                                      const std::vector<std::vector<double>>& dL_dQ_per_gauge);
+
     /**
      * Get gradients for all parameters.
      * @return Map from "reach_X_manning_n" to gradient value
@@ -146,7 +164,45 @@ private:
     std::vector<ReachState> reach_states_;
     std::vector<SVEGeometry> reach_geometry_;
     std::vector<double> lateral_inflows_;  // [m³/s] per reach
-    
+
+    // Lake configuration per reach. Inline lakes (is_lake) replace the channel PDE with a
+    // storage-discharge node; channel reaches may carry a subgrid (off-network) lake store that
+    // attenuates lateral inflow. Both stores are integrated as extra ODE states inside the CVODES
+    // system (lake_state / subgrid_state index into the state vector, appended after the channel
+    // states), so the implicit solve and the adjoint see them. Rating params mirror the MC router
+    // (route_lake/apply_subgrid_lake). For now the rating params are constants read here (lake
+    // PARAMETER gradients come in a later phase); the lake STATES are fully differentiated.
+    struct SVELake {
+        bool is_lake = false;
+        double storage_max = 1.0, s_dead = 0.0;
+        double q_ref = 0.0, exp = 1.5, q_min = 0.0, spill_coef = 1.0;
+        bool has_subgrid = false;
+        double subgrid_frac = 0.0, subgrid_storage_max = 1.0, subgrid_q_ref = 0.0, subgrid_exp = 1.0;
+        int lake_state = -1;       // state index of the inline lake storage S (-1 if not a lake)
+        int subgrid_state = -1;    // state index of the subgrid store S_sub (-1 if none)
+        double init_storage = 0.0, init_subgrid_storage = 0.0;
+        double storage = 0.0, subgrid_storage = 0.0;   // current values (pack/unpack with y)
+        // Parameter-vector indices for the differentiable rating params (-1 if N/A). The first
+        // n_reaches params are Manning's n (index == reach); lake/subgrid params follow.
+        int p_q_ref = -1, p_exp = -1, p_q_min = -1, p_spill = -1;   // inline-lake rating params
+        int p_sq_ref = -1, p_sexp = -1;                             // subgrid rating params
+    };
+    std::vector<SVELake> reach_lake_;
+    bool has_lakes_ = false;
+    int total_params_ = 0;   // Manning (n_reaches) + 4 per inline lake + 2 per subgrid store
+    std::vector<double> grad_params_;   // accumulated dL/dp over the full parameter vector
+
+    // Parameter coloring (CPR) for compute_param_sensitivity: params that share no row are
+    // structurally orthogonal and can be seeded together in one forward-mode pass. Manning is
+    // reach-local (all orthogonal -> one color); lake params also touch the downstream inlet, so
+    // they take a few more colors. Built once.
+    std::vector<std::vector<int>> param_rows_;        // [param] -> rows it affects
+    std::vector<std::vector<int>> param_color_cols_;  // [color] -> params of that color
+    int n_param_colors_ = 0;
+    bool param_sparsity_built_ = false;
+    void build_param_sparsity();
+    void collect_params(std::vector<double>& p) const;   // fill the full param-value vector
+
     // State vector mapping
     std::vector<int> reach_state_offset_;
     int total_state_size_ = 0;
@@ -167,11 +223,24 @@ private:
     double record_t0_ = 0.0;                            // time at start of recording
     std::vector<double> record_y0_;                     // packed state at start of recording
     bool adjoint_initialized_ = false;                  // CVodeAdjInit called exactly once
-    std::vector<double> dL_dQ_;                          // per-observation dL/dQ(t_k) (running-cost source)
+    // Loss sources for the backward solve: one (gauge state index, per-observation dL/dQ(t_k))
+    // pair PER GAUGE. A multi-gauge loss L = sum_g sum_k l_{g,k}(Q_g(t_k)) injects every gauge's
+    // running-cost source into a SINGLE CVodeB (see adjoint_rhs_callback) -- so multi-gauge
+    // calibration costs one backward solve, not one-per-gauge.
+    std::vector<std::pair<int, std::vector<double>>> gauge_sources_;
 
     // Gradients (accumulated during backward pass)
     std::vector<double> grad_manning_n_;
-    
+
+    // Sparse-Jacobian coloring (Curtis-Powell-Reid). Built once from the network topology +
+    // the SV stencil; lets compute_jacobian_enzyme assemble J in n_colors_ forward-mode passes
+    // instead of total_state_size_. See build_jacobian_sparsity().
+    std::vector<int> downstream_reach_;          // [topo idx] -> topo idx of the reach downstream (or -1)
+    std::vector<std::vector<int>> col_rows_;     // [column] -> row indices it affects (J sparsity, by column)
+    std::vector<std::vector<int>> color_cols_;   // [color]  -> columns sharing that color (structurally orthogonal)
+    int n_colors_ = 0;
+    bool sparsity_built_ = false;
+
     // =========== Core computation methods ===========
     
     void initialize_state();
@@ -214,7 +283,21 @@ private:
      * Uses __enzyme_fwddiff to compute columns of J efficiently.
      */
     void compute_jacobian_enzyme(double t, const double* y, double* J);
-    
+
+    /**
+     * Build the structural sparsity pattern of the Jacobian and a CPR column coloring.
+     * Called lazily (once) before the first colored Jacobian assembly.
+     */
+    void build_jacobian_sparsity();
+
+    /**
+     * Compute the (dense-stored) Jacobian via the graph-colored forward-mode sweep:
+     * one __enzyme_fwddiff per color (structurally-orthogonal columns seeded together),
+     * scattering results back through the sparsity pattern. Numerically identical to
+     * compute_jacobian_enzyme but O(#colors) passes instead of O(state size).
+     */
+    void compute_jacobian_enzyme_colored(double t, const double* y, double* J);
+
     /**
      * Compute parameter sensitivity: (∂f/∂p)ᵀλ
      * 
@@ -268,6 +351,11 @@ private:
     void setup_cvodes();
     void setup_adjoint();
     void cleanup_cvodes();
+
+    // Shared backward adjoint solve: assumes gauge_sources_ and recorded_times_ are populated.
+    // Regenerates the checkpointed forward, runs ONE CVodeB with the running-cost source(s),
+    // and accumulates dL/dn into grad_manning_n_. Used by both single- and multi-gauge entries.
+    void run_adjoint_backward();
 #endif
 };
 
@@ -297,8 +385,7 @@ inline SaintVenantEnzyme::SaintVenantEnzyme(Network& network, SaintVenantEnzymeC
         reach_states_[i].resize(n_nodes_);
         offset += 2 * n_nodes_;  // A and Q for each node
     }
-    total_state_size_ = offset;
-    
+
     // Initialize geometry from network reaches
     const auto& topo_order = network_.topological_order();
     for (int i = 0; i < n_reaches_; ++i) {
@@ -308,7 +395,44 @@ inline SaintVenantEnzyme::SaintVenantEnzyme(Network& network, SaintVenantEnzymeC
         reach_geometry_[i].width_coef = to_double(reach.geometry.width_coef);
         reach_geometry_[i].width_exp = to_double(reach.geometry.width_exp);
     }
-    
+
+    // Lake configuration + extra storage states (appended after all channel states).
+    // Parameter layout: indices [0, n_reaches) are Manning's n; lake/subgrid rating params follow.
+    reach_lake_.assign(n_reaches_, SVELake());
+    int pidx = n_reaches_;   // next free parameter index after the Manning block
+    for (int i = 0; i < n_reaches_; ++i) {
+        const Reach& reach = network_.get_reach(topo_order[i]);
+        SVELake& L = reach_lake_[i];
+        if (reach.is_lake) {
+            L.is_lake = true; has_lakes_ = true;
+            L.storage_max = reach.storage_max > 0.0 ? reach.storage_max : 1.0;
+            L.s_dead = to_double(reach.lake_s_dead);
+            L.q_ref = to_double(reach.lake_q_ref);
+            L.exp = to_double(reach.lake_exp) > 0.0 ? to_double(reach.lake_exp) : 1.5;
+            L.q_min = to_double(reach.lake_q_min);
+            L.spill_coef = to_double(reach.lake_spill_coef) > 0.0 ? to_double(reach.lake_spill_coef) : 1.0;
+            // start at the active storage that releases ~q_ref (frac=1 -> full), or current state
+            L.init_storage = to_double(reach.storage) > 0.0 ? to_double(reach.storage) : L.storage_max;
+            L.lake_state = offset++;
+            L.p_q_ref = pidx++; L.p_exp = pidx++; L.p_q_min = pidx++; L.p_spill = pidx++;
+        }
+        if (reach.has_subgrid_lake) {
+            L.has_subgrid = true; has_lakes_ = true;
+            L.subgrid_frac = reach.subgrid_lake_frac;
+            L.subgrid_storage_max = reach.subgrid_storage_max > 0.0 ? reach.subgrid_storage_max : 1.0;
+            L.subgrid_q_ref = to_double(reach.subgrid_q_ref);
+            L.subgrid_exp = to_double(reach.subgrid_exp) > 0.0 ? to_double(reach.subgrid_exp) : 1.0;
+            L.init_subgrid_storage = to_double(reach.subgrid_storage);
+            L.subgrid_state = offset++;
+            L.p_sq_ref = pidx++; L.p_sexp = pidx++;
+        }
+    }
+    total_state_size_ = offset;
+    total_params_ = pidx;
+    grad_params_.assign(total_params_, 0.0);
+    // The colored-Jacobian sparsity is lake-aware (build_jacobian_sparsity handles the storage
+    // states + inter-reach lake coupling), so coloring stays enabled with lakes present.
+
     // Initialize state
     initialize_state();
     
@@ -434,7 +558,10 @@ inline int SaintVenantEnzyme::jac_callback(sunrealtype t, N_Vector y, N_Vector f
     
 #ifdef DMC_USE_ENZYME
     if (self->config_.use_enzyme_jacobian) {
-        self->compute_jacobian_enzyme(t, N_VGetArrayPointer(y), SUNDenseMatrix_Data(J));
+        if (self->config_.use_colored_jacobian)
+            self->compute_jacobian_enzyme_colored(t, N_VGetArrayPointer(y), SUNDenseMatrix_Data(J));
+        else
+            self->compute_jacobian_enzyme(t, N_VGetArrayPointer(y), SUNDenseMatrix_Data(J));
     } else {
         self->compute_jacobian_fd(t, N_VGetArrayPointer(y), SUNDenseMatrix_Data(J));
     }
@@ -462,7 +589,10 @@ inline int SaintVenantEnzyme::adjoint_rhs_callback(sunrealtype t, N_Vector y,
     // in this build, so the entire adjoint path is forward-mode only.
     std::vector<double> J(N * N);
 #ifdef DMC_USE_ENZYME
-    self->compute_jacobian_enzyme(t, y_ptr, J.data());
+    if (self->config_.use_colored_jacobian)
+        self->compute_jacobian_enzyme_colored(t, y_ptr, J.data());
+    else
+        self->compute_jacobian_enzyme(t, y_ptr, J.data());
 #else
     self->compute_jacobian_fd(t, y_ptr, J.data());
 #endif
@@ -473,19 +603,36 @@ inline int SaintVenantEnzyme::adjoint_rhs_callback(sunrealtype t, N_Vector y,
         for (int j = 0; j < N; ++j) acc += J[i * N + j] * lambda[j];
         lambda_dot[i] = -acc;
     }
-    // Running-cost source: the discrete loss L = sum_k l_k(Q(t_k)) is folded into a
-    // continuous adjoint source g_y(t) = dL/dQ(t_k(t))/dt at the gauge, so the WHOLE backward
-    // solve is a single CVodeB with NO per-observation CVodeReInitB. The per-step reinit was
-    // restarting the BDF integrator at order 1 every step, compounding error and washing out
-    // the costate (multi-reach gradients collapsed to near-equal values). λ' = -Jᵀλ - g_y.
-    // Observation k applies over (t_{k-1}, t_k]; with t_k = record_t0_+(k+1)*dt that is
-    // k(t) = ceil((t-record_t0_)/dt)-1, clamped to [0, N-1].
-    if (!self->dL_dQ_.empty()) {
+    // Running-cost source(s): the discrete loss L = sum_g sum_k l_{g,k}(Q_g(t_k)) is folded into a
+    // continuous adjoint source g_y(t) = dL/dQ at EACH gauge, so the WHOLE backward solve is a
+    // single CVodeB with NO per-observation CVodeReInitB (per-step reinit restarted BDF at order 1,
+    // washing out the costate) AND multi-gauge costs one solve, not one-per-gauge. λ' = -Jᵀλ - g_y.
+    //
+    // Each gauge's source is sampled at observation times t_k = record_t0_ + (k+1)*dt and is
+    // injected as a TIME-CONTINUOUS (piecewise-LINEAR) interpolant, NOT a piecewise-constant
+    // boxcar. The boxcar jumps at every t_k crashed the BDF step controller (error-test failure ->
+    // step-size collapse -> low-order restart at each dt), forcing ~87 substeps per output step
+    // and making the Calgary-scale backward solve ~30 h/gradient. Linear interpolation removes the
+    // jumps (C0 source) so the integrator can take large implicit steps through the stiff-but-
+    // smooth adjoint; the gradient is unchanged in the dense-observation limit (verified: gradcheck
+    // recovery still passes). At t_k, s := (t-record_t0_)/dt - 1 == k.
+    {
         const double dt = self->config_.dt;
-        int k = static_cast<int>(std::ceil((t - self->record_t0_) / dt)) - 1;
-        if (k < 0) k = 0;
-        if (k >= static_cast<int>(self->dL_dQ_.size())) k = static_cast<int>(self->dL_dQ_.size()) - 1;
-        lambda_dot[self->gauge_state_idx_] -= self->dL_dQ_[k] / dt;
+        const double s = (t - self->record_t0_) / dt - 1.0;
+        for (const auto& gs : self->gauge_sources_) {
+            const std::vector<double>& dq = gs.second;
+            const int M = static_cast<int>(dq.size());
+            if (M == 0) continue;
+            double src;
+            if (s <= 0.0) src = dq[0];
+            else if (s >= M - 1) src = dq[M - 1];
+            else {
+                int k0 = static_cast<int>(std::floor(s));
+                double frac = s - k0;
+                src = (1.0 - frac) * dq[k0] + frac * dq[k0 + 1];
+            }
+            lambda_dot[gs.first] -= src / dt;   // inject this gauge's running-cost source
+        }
     }
     if (self->config_.verbose) {
         static int cnt = 0;
@@ -545,13 +692,11 @@ inline void SaintVenantEnzyme::compute_jacobian_enzyme(double t, const double* y
     // J[i,j] = ∂ydot[i]/∂y[j]
     
     int N = total_state_size_;
-    
-    // Collect current parameters
-    std::vector<double> params(n_reaches_);
-    for (int r = 0; r < n_reaches_; ++r) {
-        params[r] = reach_geometry_[r].manning_n;
-    }
-    
+
+    // Collect current parameters (Manning + lake rating params)
+    std::vector<double> params;
+    collect_params(params);
+
     std::vector<double> dy(N, 0.0);
     std::vector<double> dydot(N, 0.0);
     std::vector<double> ydot_base(N);
@@ -582,43 +727,266 @@ inline void SaintVenantEnzyme::compute_jacobian_enzyme(double t, const double* y
     }
 }
 
+inline void SaintVenantEnzyme::build_jacobian_sparsity() {
+    // --- Structural sparsity of J(i,j) = ∂ydot_i/∂y_j, derived from the SV stencil. ---
+    // State layout per reach r (topo idx i): [A_0,Q_0,...,A_{n-1},Q_{n-1}] at reach_state_offset_[i].
+    // Row (i,j) = ydot of node j in reach i depends on columns:
+    //   - (i,j-1),(i,j),(i,j+1)  [Rusanov left/right fluxes + local source/friction]
+    //   - for j==0: the outlet Q (node n-1, var Q) of every UPSTREAM reach, via Q_upstream.
+    // Equivalently, by COLUMN: column (i,j,v) affects rows (i,j-1),(i,j),(i,j+1), and -- only for
+    // the outlet Q column (j==n-1, v==Q) -- the node-0 rows of the single downstream reach.
+    const int N = total_state_size_;
+    const int nn = n_nodes_;
+    const auto& topo = network_.topological_order();
+
+    // downstream reach (topo idx) for each reach: the reach whose inlet junction is r's outlet junction.
+    downstream_reach_.assign(n_reaches_, -1);
+    for (int i = 0; i < n_reaches_; ++i) {
+        int dj = network_.get_reach(topo[i]).downstream_junction_id;
+        for (int k = 0; k < n_reaches_; ++k) {
+            if (network_.get_reach(topo[k]).upstream_junction_id == dj) { downstream_reach_[i] = k; break; }
+        }
+    }
+
+    auto cidx = [&](int i, int j, int v) { return reach_state_offset_[i] + 2 * j + v; };
+    // Effective-outlet column of a reach: a lake releases via its storage state, a channel via its
+    // outlet-node Q. This is the column whose perturbation changes the reach's downstream inflow.
+    auto outcol = [&](int u) { return reach_lake_[u].is_lake ? reach_lake_[u].lake_state
+                                                             : cidx(u, nn - 1, 1); };
+    col_rows_.assign(N, {});
+    for (int i = 0; i < n_reaches_; ++i) {
+        const SVELake& L = reach_lake_[i];
+        if (L.is_lake) {
+            // Inline lake: only the storage state is live; dS/dt depends on S (self). The channel
+            // nodes are frozen (ydot==0) -> their columns affect no rows.
+            col_rows_[L.lake_state].push_back(L.lake_state);
+        } else {
+            // Channel within-reach stencil: column (i,j,v) affects rows (i,j-1),(i,j),(i,j+1).
+            for (int j = 0; j < nn; ++j)
+                for (int v = 0; v < 2; ++v) {
+                    std::vector<int>& rs = col_rows_[cidx(i, j, v)];
+                    for (int jp = j - 1; jp <= j + 1; ++jp) {
+                        if (jp < 0 || jp >= nn) continue;
+                        rs.push_back(cidx(i, jp, 0));
+                        rs.push_back(cidx(i, jp, 1));
+                    }
+                }
+            // Subgrid store: its state affects its own row and (via eff_lat -> q_lat) reach i's A rows.
+            if (L.has_subgrid) {
+                col_rows_[L.subgrid_state].push_back(L.subgrid_state);
+                for (int j = 0; j < nn; ++j) col_rows_[L.subgrid_state].push_back(cidx(i, j, 0));
+            }
+        }
+        // Inter-reach coupling: this reach's effective outflow feeds its downstream reach's inlet
+        // (a channel's node-0 A,Q rows, or a downstream lake's storage row).
+        int d = downstream_reach_[i];
+        if (d >= 0) {
+            int oc = outcol(i);
+            if (reach_lake_[d].is_lake) {
+                col_rows_[oc].push_back(reach_lake_[d].lake_state);
+            } else {
+                col_rows_[oc].push_back(cidx(d, 0, 0));
+                col_rows_[oc].push_back(cidx(d, 0, 1));
+            }
+        }
+    }
+
+    // --- Greedy distance-1 column coloring (CPR): two columns conflict iff they share a row;
+    // columns of the same color are then structurally orthogonal and can be seeded together. ---
+    std::vector<std::vector<int>> row_cols(N);
+    for (int c = 0; c < N; ++c)
+        for (int i : col_rows_[c]) row_cols[i].push_back(c);
+
+    std::vector<int> col_color(N, -1);
+    std::vector<int> forbidden(N, -1);  // forbidden[color] = last column that forbade it
+    n_colors_ = 0;
+    for (int c = 0; c < N; ++c) {
+        // mark colors used by columns conflicting with c (sharing any row)
+        for (int i : col_rows_[c])
+            for (int other : row_cols[i])
+                if (other != c && col_color[other] >= 0) forbidden[col_color[other]] = c;
+        int k = 0;
+        while (k < n_colors_ && forbidden[k] == c) ++k;
+        if (k == n_colors_) ++n_colors_;
+        col_color[c] = k;
+    }
+    color_cols_.assign(n_colors_, {});
+    for (int c = 0; c < N; ++c) color_cols_[col_color[c]].push_back(c);
+    sparsity_built_ = true;
+
+    if (config_.verbose) {
+        std::cerr << "[sparsity] state=" << N << " colors=" << n_colors_
+                  << " -> " << (n_colors_ > 0 ? N / n_colors_ : 0)
+                  << "x fewer Enzyme passes per Jacobian" << std::endl;
+    }
+}
+
+inline void SaintVenantEnzyme::compute_jacobian_enzyme_colored(double t, const double* y, double* J) {
+    if (!sparsity_built_) build_jacobian_sparsity();
+    const int N = total_state_size_;
+
+    std::vector<double> params;
+    collect_params(params);
+
+    // Dense storage, structural zeros must be explicitly zeroed (we only scatter nonzeros).
+    std::fill(J, J + (size_t)N * N, 0.0);
+
+    std::vector<double> dy(N, 0.0), dydot(N, 0.0);
+    for (int color = 0; color < n_colors_; ++color) {
+        std::fill(dy.begin(), dy.end(), 0.0);
+        for (int c : color_cols_[color]) dy[c] = 1.0;     // seed all columns of this color at once
+        std::fill(dydot.begin(), dydot.end(), 0.0);
+
+        __enzyme_fwddiff((void*)rhs_wrapper,
+            enzyme_const, t,
+            enzyme_dup, y, dy.data(),
+            enzyme_const, params.data(),
+            enzyme_dupnoneed, nullptr, dydot.data(),
+            enzyme_const, this);
+
+        // Recover: for each column c in this color, rows it owns are structurally disjoint from
+        // every other seeded column, so dydot[i] == J(i,c) exactly. Scatter (column-major).
+        for (int c : color_cols_[color])
+            for (int i : col_rows_[c]) J[(size_t)c * N + i] = dydot[i];
+    }
+}
+
+inline void SaintVenantEnzyme::build_param_sparsity() {
+    // Rows each parameter affects (∂f_i/∂p_k != 0), from the RHS structure:
+    //  - Manning n_r  -> reach r's channel Q rows (none if r is a frozen lake reach).
+    //  - inline-lake params of r (q_ref/exp/q_min/spill) -> r's lake-storage row, and -- via the
+    //    rating feeding the downstream inlet flux -- the node-0 (A,Q) rows of r's downstream reach.
+    //  - subgrid params of r (q_ref/exp) -> r's subgrid-storage row, and -- via eff_lat -> q_lat --
+    //    reach r's A rows.
+    const auto& topo = network_.topological_order();
+    param_rows_.assign(total_params_, {});
+    // downstream reach (topo idx) per reach
+    std::vector<int> down(n_reaches_, -1);
+    for (int i = 0; i < n_reaches_; ++i) {
+        int dj = network_.get_reach(topo[i]).downstream_junction_id;
+        for (int k = 0; k < n_reaches_; ++k)
+            if (network_.get_reach(topo[k]).upstream_junction_id == dj) { down[k] = i; break; }
+    }
+    for (int r = 0; r < n_reaches_; ++r) {
+        const SVELake& L = reach_lake_[r];
+        int off = reach_state_offset_[r];
+        if (!L.is_lake) {
+            for (int j = 0; j < n_nodes_; ++j) param_rows_[r].push_back(off + 2*j + 1);  // Manning -> Q rows
+        }
+        if (L.is_lake) {
+            std::vector<int> rows = {L.lake_state};
+            if (down[r] >= 0) { rows.push_back(reach_state_offset_[down[r]]); rows.push_back(reach_state_offset_[down[r]] + 1); }
+            for (int pk : {L.p_q_ref, L.p_exp, L.p_q_min, L.p_spill}) param_rows_[pk] = rows;
+        }
+        if (L.has_subgrid) {
+            std::vector<int> rows = {L.subgrid_state};
+            for (int j = 0; j < n_nodes_; ++j) rows.push_back(off + 2*j);  // subgrid -> A rows (via lateral)
+            for (int pk : {L.p_sq_ref, L.p_sexp}) param_rows_[pk] = rows;
+        }
+    }
+    // Greedy distance-1 coloring of parameters (share a row => conflict).
+    std::vector<std::vector<int>> row_params(total_state_size_);
+    for (int k = 0; k < total_params_; ++k)
+        for (int i : param_rows_[k]) row_params[i].push_back(k);
+    std::vector<int> color(total_params_, -1), forbidden(total_params_, -1);
+    n_param_colors_ = 0;
+    for (int k = 0; k < total_params_; ++k) {
+        for (int i : param_rows_[k])
+            for (int o : row_params[i]) if (o != k && color[o] >= 0) forbidden[color[o]] = k;
+        int c = 0; while (c < n_param_colors_ && forbidden[c] == k) ++c;
+        if (c == n_param_colors_) ++n_param_colors_;
+        color[k] = c;
+    }
+    param_color_cols_.assign(n_param_colors_, {});
+    for (int k = 0; k < total_params_; ++k) param_color_cols_[color[k]].push_back(k);
+    param_sparsity_built_ = true;
+}
+
 inline void SaintVenantEnzyme::compute_param_sensitivity(double t, const double* y,
                                                           const double* lambda,
                                                           double* grad_p) {
-    // Compute (∂f/∂p)ᵀλ for parameter gradients
-    // p = [manning_n_0, manning_n_1, ...]
-    
-    int N = total_state_size_;
-    int P = n_reaches_;
-    
-    // Collect current parameters
-    std::vector<double> params(P);
-    for (int r = 0; r < P; ++r) {
-        params[r] = reach_geometry_[r].manning_n;
-    }
-    
-    // Initialize output gradients
+    // (∂f/∂p)ᵀλ for the FULL parameter vector (Manning + lake rating params), via forward-mode
+    // AD with CPR coloring: params that share no row are seeded together. For each param k in a
+    // color, grad_p[k] = Σ_{i ∈ param_rows_[k]} dydot_i · λ_i (rows are orthogonal within a color,
+    // so dydot_i == ∂f_i/∂p_k there). Reverse-mode would give this in one pass but segfaults here.
+    if (!param_sparsity_built_) build_param_sparsity();
+    const int N = total_state_size_;
+    const int P = total_params_;
+
+    std::vector<double> params;
+    collect_params(params);
     std::fill(grad_p, grad_p + P, 0.0);
 
-    // Parameter sensitivity via FORWARD-mode AD (reverse-mode __enzyme_autodiff
-    // segfaults in this build; forward-mode __enzyme_fwddiff is stable). For each
-    // parameter p_r we seed dp_r = 1 and read dydot = ∂f/∂p_r, then contract with
-    // the adjoint state: (∂f/∂p_r)ᵀλ = Σ_i dydot_i · λ_i.
-    std::vector<double> dparams(P, 0.0);
-    std::vector<double> dydot(N, 0.0);
-    for (int r = 0; r < P; ++r) {
+    std::vector<double> dparams(P, 0.0), dydot(N, 0.0);
+    for (int color = 0; color < n_param_colors_; ++color) {
         std::fill(dparams.begin(), dparams.end(), 0.0);
-        dparams[r] = 1.0;
+        for (int k : param_color_cols_[color]) dparams[k] = 1.0;
         std::fill(dydot.begin(), dydot.end(), 0.0);
         __enzyme_fwddiff((void*)rhs_wrapper,
             enzyme_const, t,
             enzyme_const, y,                          // y held constant
-            enzyme_dup, params.data(), dparams.data(),// seed parameter r
-            enzyme_dupnoneed, nullptr, dydot.data(),  // tangent output ∂f/∂p_r
+            enzyme_dup, params.data(), dparams.data(),// seed all params of this color
+            enzyme_dupnoneed, nullptr, dydot.data(),
             enzyme_const, this);
-        double s = 0.0;
-        for (int i = 0; i < N; ++i) s += dydot[i] * lambda[i];
-        grad_p[r] = s;
+        for (int k : param_color_cols_[color]) {
+            double s = 0.0;
+            for (int i : param_rows_[k]) s += dydot[i] * lambda[i];
+            grad_p[k] = s;
+        }
+    }
+
+    // ---- Inter-reach lake-PARAMETER term. Enzyme drops the lake rating's param tangent through
+    // the DOWNSTREAM coupling (the colored passes above give lake params only the storage-row
+    // term, with the downstream-inlet contribution structurally zero). Fix exactly: the lake
+    // storage s affects the loss ONLY through the outflow Q_L(s; p), so
+    //   dL/dp = (∂Q_L/∂p) · (∂L/∂Q_L) = (∂Q_L/∂p / ∂Q_L/∂s) · A,
+    // where A = Σ_i (∂f_i/∂s)·λ_i is the full state-s tangent contracted with λ (Enzyme DOES
+    // capture the s STATE coupling, incl. downstream). One state-seed pass per lake gives A and
+    // ∂Q_L/∂s (= -dydot_s[storage]·Smax); ∂Q_L/∂p is analytic from the rating. This OVERWRITES the
+    // (incomplete) colored-pass values for the lake/subgrid params. Manning params are unaffected.
+    if (has_lakes_) {
+        std::vector<double> dys(N, 0.0), dyds(N, 0.0);
+        for (int r = 0; r < n_reaches_; ++r) {
+            const SVELake& L = reach_lake_[r];
+            if (L.is_lake) {
+                std::fill(dys.begin(), dys.end(), 0.0); dys[L.lake_state] = 1.0;
+                std::fill(dyds.begin(), dyds.end(), 0.0);
+                __enzyme_fwddiff((void*)rhs_wrapper, enzyme_const, t,
+                    enzyme_dup, y, dys.data(), enzyme_const, params.data(),
+                    enzyme_dupnoneed, nullptr, dyds.data(), enzyme_const, this);
+                double A = 0.0; for (int i = 0; i < N; ++i) A += dyds[i] * lambda[i];
+                double dQds = -dyds[L.lake_state] * L.storage_max;   // ∂(dS/dt)/∂s = -∂Q/∂s/Smax
+                double ratio = (std::abs(dQds) > 1e-30) ? (A / dQds) : 0.0;
+                // analytic ∂Q_L/∂params at the current storage
+                double S = y[L.lake_state] * L.storage_max;
+                double denom = (L.storage_max - L.s_dead) > 1.0 ? (L.storage_max - L.s_dead) : 1.0;
+                double frac = (S - L.s_dead) / denom; frac = frac < 0.0 ? 0.0 : (frac > 1.0 ? 1.0 : frac);
+                double fr = frac < 1e-12 ? 1e-12 : frac;
+                double fpow = std::pow(fr, params[L.p_exp]);
+                double over = (S - L.storage_max) > 0.0 ? (S - L.storage_max) : 0.0;
+                grad_p[L.p_q_ref] = fpow * ratio;
+                grad_p[L.p_q_min] = (1.0 - fpow) * ratio;
+                grad_p[L.p_exp]   = (params[L.p_q_ref] - params[L.p_q_min]) * fpow * std::log(fr) * ratio;
+                grad_p[L.p_spill] = (over / config_.dt) * ratio;
+            }
+            if (L.has_subgrid) {
+                std::fill(dys.begin(), dys.end(), 0.0); dys[L.subgrid_state] = 1.0;
+                std::fill(dyds.begin(), dyds.end(), 0.0);
+                __enzyme_fwddiff((void*)rhs_wrapper, enzyme_const, t,
+                    enzyme_dup, y, dys.data(), enzyme_const, params.data(),
+                    enzyme_dupnoneed, nullptr, dyds.data(), enzyme_const, this);
+                double A = 0.0; for (int i = 0; i < N; ++i) A += dyds[i] * lambda[i];
+                double dQds = -dyds[L.subgrid_state] * L.subgrid_storage_max;
+                double ratio = (std::abs(dQds) > 1e-30) ? (A / dQds) : 0.0;
+                double S = y[L.subgrid_state] * L.subgrid_storage_max;
+                double smx = L.subgrid_storage_max > 1.0 ? L.subgrid_storage_max : 1.0;
+                double frac = S / smx; frac = frac < 0.0 ? 0.0 : (frac > 1.0 ? 1.0 : frac);
+                double fr = frac < 1e-12 ? 1e-12 : frac;
+                double fpow = std::pow(fr, params[L.p_sexp]);
+                grad_p[L.p_sq_ref] = fpow * ratio;
+                grad_p[L.p_sexp]   = params[L.p_sq_ref] * fpow * std::log(fr) * ratio;
+            }
+        }
     }
 }
 
@@ -669,6 +1037,11 @@ inline void SaintVenantEnzyme::initialize_state() {
             reach_states_[i].Q[j] = Q0;
         }
     }
+    // Initialize lake/subgrid storage states.
+    for (int i = 0; i < n_reaches_; ++i) {
+        reach_lake_[i].storage = reach_lake_[i].init_storage;
+        reach_lake_[i].subgrid_storage = reach_lake_[i].init_subgrid_storage;
+    }
 }
 
 inline void SaintVenantEnzyme::pack_state(double* y) const {
@@ -678,6 +1051,13 @@ inline void SaintVenantEnzyme::pack_state(double* y) const {
             y[off + 2*j] = reach_states_[i].A[j];
             y[off + 2*j + 1] = reach_states_[i].Q[j];
         }
+        // Lake storage states are stored NORMALIZED (s = S / S_max ~ O(1)). The physical storage
+        // is O(1e6) m^3 while flows are O(10), and a state vector spanning 1e6 makes the dense
+        // backward-solve LU ill-conditioned -> wrong lake-storage costate -> wrong lake-parameter
+        // gradients. Normalizing keeps every state O(1).
+        const SVELake& L = reach_lake_[i];
+        if (L.lake_state >= 0) y[L.lake_state] = L.storage / L.storage_max;
+        if (L.subgrid_state >= 0) y[L.subgrid_state] = L.subgrid_storage / L.subgrid_storage_max;
     }
 }
 
@@ -688,15 +1068,59 @@ inline void SaintVenantEnzyme::unpack_state(const double* y) {
             reach_states_[i].A[j] = std::max(y[off + 2*j], config_.min_area);
             reach_states_[i].Q[j] = y[off + 2*j + 1];
         }
+        SVELake& L = reach_lake_[i];
+        if (L.lake_state >= 0)
+            L.storage = std::max(y[L.lake_state], 0.0) * L.storage_max;            // de-normalize
+        if (L.subgrid_state >= 0)
+            L.subgrid_storage = std::max(y[L.subgrid_state], 0.0) * L.subgrid_storage_max;
+    }
+}
+
+// Inline lake/reservoir storage-discharge rating Q(S), mirroring the MC router's route_lake but
+// in continuous (ODE) form for CVODES: Q = q_min + (q_ref-q_min)*frac^exp + spill, with
+// frac = clamp((S-Sdead)/(Smax-Sdead), 0, 1) and spill = spill_coef*max(S-Smax,0)/dt. Free
+// function so Enzyme differentiates it through the call (active arg: S). The rating params are
+// routed from params[] so they carry tangents; the inter-reach (downstream) param tangent that
+// Enzyme drops is added analytically in compute_param_sensitivity.
+inline double sve_lake_rating(double S, double Smax, double Sdead, double q_min, double q_ref,
+                              double expn, double spill_coef, double dt) {
+    double denom = (Smax - Sdead) > 1.0 ? (Smax - Sdead) : 1.0;
+    double frac = (S - Sdead) / denom;
+    frac = frac < 0.0 ? 0.0 : (frac > 1.0 ? 1.0 : frac);
+    double fr = frac < 1e-12 ? 1e-12 : frac;     // floor keeps pow() derivative finite at S=Sdead
+    double release = q_min + (q_ref - q_min) * std::pow(fr, expn);
+    double over = (S - Smax) > 0.0 ? (S - Smax) : 0.0;
+    double Q = release + spill_coef * over / dt;
+    return Q > 0.0 ? Q : 0.0;
+}
+
+// Subgrid (off-network) lake store rating Q(S) = q_ref * frac^exp, frac = clamp(S/Smax, 0, 1).
+inline double sve_subgrid_rating(double S, double Smax, double q_ref, double expn) {
+    double fr = S / (Smax > 1.0 ? Smax : 1.0);
+    fr = fr < 0.0 ? 0.0 : (fr > 1.0 ? 1.0 : fr);
+    double frp = fr < 1e-12 ? 1e-12 : fr;
+    double Q = q_ref * std::pow(frp, expn);
+    return Q > 0.0 ? Q : 0.0;
+}
+
+inline void SaintVenantEnzyme::collect_params(std::vector<double>& p) const {
+    // Full parameter-value vector: Manning's n in [0,n_reaches), then lake/subgrid rating params.
+    p.assign(total_params_, 0.0);
+    for (int r = 0; r < n_reaches_; ++r) p[r] = reach_geometry_[r].manning_n;
+    for (int r = 0; r < n_reaches_; ++r) {
+        const SVELake& L = reach_lake_[r];
+        if (L.is_lake) {
+            p[L.p_q_ref] = L.q_ref; p[L.p_exp] = L.exp; p[L.p_q_min] = L.q_min; p[L.p_spill] = L.spill_coef;
+        }
+        if (L.has_subgrid) {
+            p[L.p_sq_ref] = L.subgrid_q_ref; p[L.p_sexp] = L.subgrid_exp;
+        }
     }
 }
 
 inline void SaintVenantEnzyme::compute_rhs(double t, const double* y, double* ydot) {
-    // Use current Manning's n from geometry
-    std::vector<double> params(n_reaches_);
-    for (int r = 0; r < n_reaches_; ++r) {
-        params[r] = reach_geometry_[r].manning_n;
-    }
+    std::vector<double> params;
+    collect_params(params);
     compute_rhs_with_params(t, y, params.data(), ydot);
 }
 
@@ -725,35 +1149,66 @@ inline void SaintVenantEnzyme::compute_rhs_with_params(
     // Process each reach
     for (int r = 0; r < n_reaches_; ++r) {
         const Reach& reach = network_.get_reach(topo_order[r]);
-        SVEGeometry geom = reach_geometry_[r];
-        // NOTE: do NOT route the active parameter through geom.manning_n -- Enzyme drops the
-        // tangent through this struct member (geom is copied from an enzyme_const member).
-        // Instead pass params[r] directly into friction_slope below. geom.manning_n is left
-        // as-is and only used by the non-differentiated friction_slope(Q,A,R) overload, which
-        // we no longer call on this path.
-        const double manning_r = params[r];  // active parameter, flows straight into Sf
-
-        double dx = reach.length / (n_nodes_ - 1);
+        const SVELake& Lk = reach_lake_[r];
         int off = reach_state_offset_[r];
 
         double lat_r = use_hist ? lateral_history_[lstep][r] : lateral_inflows_[r];
-        // Lateral inflow per unit length
-        double q_lat = lat_r / reach.length;
-        
-        // Upstream boundary: sum of upstream reach outflows
+
+        // Upstream boundary: sum of upstream-reach EFFECTIVE outflows. A lake upstream releases
+        // its rating Q(S_u) (from the lake-storage state), not its channel outlet node.
         double Q_upstream = 0.0;
         Junction& up_junc = network_.get_junction(reach.upstream_junction_id);
         for (int up_reach_id : up_junc.upstream_reach_ids) {
             for (int ur = 0; ur < n_reaches_; ++ur) {
                 if (topo_order[ur] == up_reach_id) {
-                    int up_off = reach_state_offset_[ur];
-                    Q_upstream += y[up_off + 2*(n_nodes_-1) + 1];
+                    const SVELake& Lu = reach_lake_[ur];
+                    if (Lu.is_lake) {
+                        Q_upstream += sve_lake_rating(y[Lu.lake_state] * Lu.storage_max, Lu.storage_max,
+                                                      Lu.s_dead, params[Lu.p_q_min], params[Lu.p_q_ref],
+                                                      params[Lu.p_exp], params[Lu.p_spill], config_.dt);
+                    } else {
+                        Q_upstream += y[reach_state_offset_[ur] + 2*(n_nodes_-1) + 1];
+                    }
                     break;
                 }
             }
         }
-        Q_upstream += lat_r * 0.5;  // Half at inlet
-        
+
+        // ---- Inline lake/reservoir: storage node, not a channel. Freeze the channel states and
+        // integrate dS/dt = I - Q(S); downstream reaches read Q(S) via the loop above. ----
+        if (Lk.is_lake) {
+            for (int j = 0; j < n_nodes_; ++j) { ydot[off + 2*j] = 0.0; ydot[off + 2*j + 1] = 0.0; }
+            double Qout = sve_lake_rating(y[Lk.lake_state] * Lk.storage_max, Lk.storage_max, Lk.s_dead,
+                                          params[Lk.p_q_min], params[Lk.p_q_ref],
+                                          params[Lk.p_exp], params[Lk.p_spill], config_.dt);
+            // normalized storage: d(S/Smax)/dt = (I - Q(S)) / Smax
+            ydot[Lk.lake_state] = ((Q_upstream + lat_r) - Qout) / Lk.storage_max;
+            continue;
+        }
+
+        // ---- Channel reach: optional subgrid lake attenuation of the lateral inflow. A fraction
+        // subgrid_frac of lat_r flows through an aggregate store (its own ODE state); the channel
+        // sees direct + store-outflow. ----
+        double eff_lat = lat_r;
+        if (Lk.has_subgrid) {
+            double to_lake = Lk.subgrid_frac * lat_r;
+            double Qsub = sve_subgrid_rating(y[Lk.subgrid_state] * Lk.subgrid_storage_max,
+                                             Lk.subgrid_storage_max, params[Lk.p_sq_ref], params[Lk.p_sexp]);
+            ydot[Lk.subgrid_state] = (to_lake - Qsub) / Lk.subgrid_storage_max;  // normalized store
+            eff_lat = (lat_r - to_lake) + Qsub;
+        }
+
+        SVEGeometry geom = reach_geometry_[r];
+        // NOTE: do NOT route the active parameter through geom.manning_n -- Enzyme drops the
+        // tangent through this struct member (geom is copied from an enzyme_const member).
+        const double manning_r = params[r];  // active parameter, flows straight into Sf
+
+        double dx = reach.length / (n_nodes_ - 1);
+        // Lateral inflow as a source DENSITY (per unit length): added at all n_nodes nodes, each a
+        // dx=length/(n_nodes-1) cell, so divide by (n_nodes*dx) to inject exactly eff_lat (see the
+        // mass-conservation fix). Upstream inflow enters purely as the inlet flux below.
+        double q_lat = eff_lat / (n_nodes_ * dx);
+
         // Interior nodes
         for (int j = 0; j < n_nodes_; ++j) {
             double A_j = y[off + 2*j];
@@ -916,6 +1371,10 @@ inline double SaintVenantEnzyme::get_discharge(int reach_id) const {
     const auto& topo_order = network_.topological_order();
     for (int i = 0; i < n_reaches_; ++i) {
         if (topo_order[i] == reach_id) {
+            const SVELake& Lk = reach_lake_[i];
+            if (Lk.is_lake)   // lake outlet = storage-discharge rating, not the channel node
+                return sve_lake_rating(Lk.storage, Lk.storage_max, Lk.s_dead, Lk.q_min,
+                                       Lk.q_ref, Lk.exp, Lk.spill_coef, config_.dt);
             return reach_states_[i].Q.back();
         }
     }
@@ -923,9 +1382,13 @@ inline double SaintVenantEnzyme::get_discharge(int reach_id) const {
 }
 
 inline std::vector<double> SaintVenantEnzyme::get_all_discharges() const {
-    std::vector<double> result;
-    for (const auto& state : reach_states_) {
-        result.push_back(state.Q.back());
+    std::vector<double> result(n_reaches_);
+    for (int i = 0; i < n_reaches_; ++i) {
+        const SVELake& Lk = reach_lake_[i];
+        result[i] = Lk.is_lake
+            ? sve_lake_rating(Lk.storage, Lk.storage_max, Lk.s_dead, Lk.q_min,
+                              Lk.q_ref, Lk.exp, Lk.spill_coef, config_.dt)
+            : reach_states_[i].Q.back();
     }
     return result;
 }
@@ -976,37 +1439,59 @@ inline void SaintVenantEnzyme::stop_recording() {
     recording_ = false;
 }
 
-inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id, 
-                                                  const std::vector<double>& dL_dQ) {
+inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id,
+                                                 const std::vector<double>& dL_dQ) {
+    // Single-gauge convenience wrapper around the multi-gauge entry point.
+    compute_gradients_multigauge(std::vector<int>{gauge_reach_id},
+                                 std::vector<std::vector<double>>{dL_dQ});
+}
+
+inline void SaintVenantEnzyme::compute_gradients_multigauge(
+    const std::vector<int>& gauge_reach_ids,
+    const std::vector<std::vector<double>>& dL_dQ_per_gauge) {
 #ifdef DMC_ENABLE_SUNDIALS
     if (recorded_times_.empty()) {
         std::cerr << "No recorded outputs for gradient computation" << std::endl;
         return;
     }
-    
-    if (dL_dQ.size() != recorded_times_.size()) {
-        std::cerr << "dL_dQ size (" << dL_dQ.size() << ") doesn't match recorded times ("
-                  << recorded_times_.size() << ")" << std::endl;
+    if (gauge_reach_ids.size() != dL_dQ_per_gauge.size()) {
+        std::cerr << "gauge count (" << gauge_reach_ids.size() << ") != dL_dQ series count ("
+                  << dL_dQ_per_gauge.size() << ")" << std::endl;
         return;
     }
-    
-    // Find gauge reach index
-    int gauge_idx = -1;
+
+    // Resolve every gauge reach to its outlet-Q state index and stage the running-cost sources.
     const auto& topo_order = network_.topological_order();
-    for (int i = 0; i < n_reaches_; ++i) {
-        if (topo_order[i] == gauge_reach_id) {
-            gauge_idx = i;
-            // Index of outlet Q in state vector
-            gauge_state_idx_ = reach_state_offset_[i] + 2*(n_nodes_-1) + 1;
-            break;
+    gauge_sources_.clear();
+    for (size_t gi = 0; gi < gauge_reach_ids.size(); ++gi) {
+        if (dL_dQ_per_gauge[gi].size() != recorded_times_.size()) {
+            std::cerr << "dL_dQ[" << gi << "] size (" << dL_dQ_per_gauge[gi].size()
+                      << ") doesn't match recorded times (" << recorded_times_.size() << ")" << std::endl;
+            return;
         }
+        int idx = -1;
+        for (int i = 0; i < n_reaches_; ++i) {
+            if (topo_order[i] == gauge_reach_ids[gi]) {
+                idx = reach_state_offset_[i] + 2*(n_nodes_-1) + 1;  // outlet Q state index
+                break;
+            }
+        }
+        if (idx < 0) {
+            std::cerr << "Gauge reach " << gauge_reach_ids[gi] << " not found" << std::endl;
+            return;
+        }
+        gauge_sources_.emplace_back(idx, dL_dQ_per_gauge[gi]);
     }
-    
-    if (gauge_idx < 0) {
-        std::cerr << "Gauge reach " << gauge_reach_id << " not found" << std::endl;
-        return;
-    }
-    
+    gauge_state_idx_ = gauge_sources_.empty() ? -1 : gauge_sources_[0].first;  // verbose dump only
+
+    run_adjoint_backward();
+#else
+    std::cerr << "SUNDIALS required for adjoint gradient computation" << std::endl;
+#endif
+}
+
+#ifdef DMC_ENABLE_SUNDIALS
+inline void SaintVenantEnzyme::run_adjoint_backward() {
     // Initialize adjoint state: λ(T) = ∂L/∂y(T)
     // Only the gauge Q component is non-zero
     yB_ = N_VNew_Serial(total_state_size_, sunctx_);
@@ -1054,10 +1539,9 @@ inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id,
         return;
     }
     
-    // Store the per-observation loss gradient; the adjoint RHS consumes it as a continuous
-    // running-cost source (see adjoint_rhs_callback). Terminal condition is therefore
-    // λ(T) = 0 -- ALL observations (including the one at t_final) enter via the source term.
-    dL_dQ_ = dL_dQ;
+    // The per-gauge running-cost sources (gauge_sources_) are consumed by adjoint_rhs_callback.
+    // Terminal condition is λ(T) = 0 -- ALL observations (including the one at t_final, across
+    // every gauge) enter via the source term.
     N_VConst(0.0, yB_);
 
     flag = CVodeInitB(cvode_mem_, indexB_, adjoint_rhs_callback, t_final, yB_);
@@ -1077,7 +1561,7 @@ inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id,
     flag = CVodeSetLinearSolverB(cvode_mem_, indexB_, LSB, JB);
     
     // Initialize quadrature for parameter sensitivity
-    N_Vector qB = N_VNew_Serial(n_reaches_, sunctx_);
+    N_Vector qB = N_VNew_Serial(total_params_, sunctx_);
     N_VConst(0.0, qB);
     flag = CVodeQuadInitB(cvode_mem_, indexB_, quad_rhs_callback, qB);
     flag = CVodeQuadSStolerancesB(cvode_mem_, indexB_, config_.rel_tol, config_.abs_tol);
@@ -1113,11 +1597,10 @@ inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id,
     flag = CVodeGetQuadB(cvode_mem_, indexB_, &tBret, qB);
 
     double* grad = N_VGetArrayPointer(qB);
-    for (int r = 0; r < n_reaches_; ++r) {
-        grad_manning_n_[r] = -grad[r];
-    }
+    for (int k = 0; k < total_params_; ++k) grad_params_[k] = -grad[k];
+    for (int r = 0; r < n_reaches_; ++r) grad_manning_n_[r] = grad_params_[r];  // Manning block
     if (dbg) {
-        std::cerr << "[adj] final grad:";
+        std::cerr << "[adj] final grad (manning):";
         for (int r = 0; r < n_reaches_; ++r) std::cerr << " " << grad_manning_n_[r];
         std::cerr << std::endl;
     }
@@ -1130,26 +1613,37 @@ inline void SaintVenantEnzyme::compute_gradients(int gauge_reach_id,
     if (config_.verbose) {
         std::cout << "  Gradients computed via CVODES adjoint + Enzyme" << std::endl;
     }
-
-#else
-    std::cerr << "SUNDIALS required for adjoint gradient computation" << std::endl;
-#endif
 }
+#endif // DMC_ENABLE_SUNDIALS
 
 inline std::unordered_map<std::string, double> SaintVenantEnzyme::get_gradients() const {
     std::unordered_map<std::string, double> grads;
     const auto& topo_order = network_.topological_order();
     
     for (int i = 0; i < n_reaches_; ++i) {
-        std::string key = "reach_" + std::to_string(topo_order[i]) + "_manning_n";
-        grads[key] = grad_manning_n_[i];
+        std::string rk = "reach_" + std::to_string(topo_order[i]);
+        grads[rk + "_manning_n"] = grad_params_.empty() ? grad_manning_n_[i] : grad_params_[i];
+        // Lake RATING-parameter gradients (validated vs FD ~0.99 and by parameter recovery): the
+        // inter-reach term is added analytically in compute_param_sensitivity (Enzyme drops that
+        // tangent). Manning grads are correct too (a lake reach's Manning grad is exactly 0).
+        const SVELake& L = reach_lake_[i];
+        if (L.is_lake) {
+            grads[rk + "_lake_q_ref"]      = grad_params_[L.p_q_ref];
+            grads[rk + "_lake_exp"]        = grad_params_[L.p_exp];
+            grads[rk + "_lake_q_min"]      = grad_params_[L.p_q_min];
+            grads[rk + "_lake_spill_coef"] = grad_params_[L.p_spill];
+        }
+        if (L.has_subgrid) {
+            grads[rk + "_subgrid_q_ref"] = grad_params_[L.p_sq_ref];
+            grads[rk + "_subgrid_exp"]   = grad_params_[L.p_sexp];
+        }
     }
-    
     return grads;
 }
 
 inline void SaintVenantEnzyme::reset_gradients() {
     std::fill(grad_manning_n_.begin(), grad_manning_n_.end(), 0.0);
+    std::fill(grad_params_.begin(), grad_params_.end(), 0.0);
 }
 
 } // namespace dmc

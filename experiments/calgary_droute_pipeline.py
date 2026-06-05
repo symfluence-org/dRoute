@@ -10,11 +10,11 @@ One entry point that takes a SUMMA runoff file and produces the full dRoute stor
   2. Evaluate each at the 5 nested Bow mainstem WSC gauges (KGE / NSE).
   3. Emit a metrics CSV, a per-gauge KGE bar chart, and nested hydrographs.
 
-Run on the current (uncalibrated) runoff now, and re-run with --runoff pointing at the
-SUMMA-calibrated runoff once the ASYNC-DDS calibration completes:
+Runs on the SUMMA-calibrated runoff (async-DDS) by default; pass --runoff to route a
+different SUMMA output:
 
-    python experiments/calgary_droute_pipeline.py --label baseline
-    python experiments/calgary_droute_pipeline.py --runoff <calibrated.nc> --label calibrated
+    python experiments/calgary_droute_pipeline.py --label calibrated
+    python experiments/calgary_droute_pipeline.py --runoff <other.nc> --label variant
 """
 import argparse
 import numpy as np
@@ -58,7 +58,7 @@ def nse(s, o):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--runoff", default=None, help="SUMMA runoff netCDF (default: current uncalibrated)")
+    ap.add_argument("--runoff", default=None, help="SUMMA runoff netCDF (default: async-DDS-calibrated)")
     ap.add_argument("--label", default="baseline", help="tag for output files")
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--lr", type=float, default=0.015)

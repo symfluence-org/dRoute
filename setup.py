@@ -76,7 +76,8 @@ class CMakeBuild(build_ext):
 
 setup(
     name="droute",
-    version="0.5.1",
+    # Keep in sync with python/droute/_version.py (the source of truth pyproject reads dynamically).
+    version="0.6.0",
     packages=find_packages(where="python"),
     package_dir={"": "python"},
     ext_modules=[CMakeExtension("_droute_core")],

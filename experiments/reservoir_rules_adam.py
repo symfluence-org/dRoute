@@ -12,8 +12,8 @@ vs WSC observations, with the analytical dKGE/dQ gradient (verified against fini
 cos = 1.0) seeding dRoute's reverse pass -- i.e. Adam optimises the actual calibration objective,
 not an MSE surrogate. The best calibration KGE is kept.
 
-Run AFTER the SUMMA hydrology calibration so the routed volumes are unbiased; works on the
-current runoff too (machinery test).
+Runs on the SUMMA-calibrated runoff (async-DDS), so the routed volumes are unbiased and the
+reservoir-rule calibration operates against a realistic hydrograph.
 """
 import glob
 import numpy as np
@@ -56,8 +56,9 @@ def build_network(seg_ids, downstream_idx, lengths, slopes, mannings_n=0.035):
     return net
 
 
-def load_inputs(runoff_path=None):
+def load_inputs(runoff_path=None, end_date=None):
     runoff_path = runoff_path or f"{D}/simulations/bow_calgary_v1/SUMMA/bow_calgary_v1_timestep.nc"
+    end_date = end_date or CAL[1]
     rn = gpd.read_file(glob.glob(f"{D}/shapefiles/river_network/*.shp")[0])
     seg_ids = rn["LINKNO"].astype(int).values
     id_to_idx = {int(s): i for i, s in enumerate(seg_ids)}
@@ -270,6 +271,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--lr", type=float, default=0.015)
-    ap.add_argument("--runoff", default=None, help="SUMMA runoff netCDF (default: current uncalibrated)")
+    ap.add_argument("--runoff", default=None, help="SUMMA runoff netCDF (default: async-DDS-calibrated)")
     a = ap.parse_args()
     main(epochs=a.epochs, lr=a.lr, runoff_path=a.runoff)

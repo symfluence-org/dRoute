@@ -10,11 +10,18 @@ def test_droute_import():
 
 
 def test_version():
-    """Test that version is accessible."""
+    """Test that version is accessible and matches the single source of truth."""
+    import re
+
     import droute
+    from droute import _version
+
     assert hasattr(droute, '__version__')
     assert isinstance(droute.__version__, str)
-    assert droute.__version__ == "0.5.1"
+    # Exposed version comes from droute._version (the source of truth pyproject also reads).
+    assert droute.__version__ == _version.__version__
+    # ...and is a well-formed version string (avoids a hardcoded literal going stale on bumps).
+    assert re.match(r'^\d+\.\d+\.\d+', droute.__version__), droute.__version__
 
 
 def test_author():

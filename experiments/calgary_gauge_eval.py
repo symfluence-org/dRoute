@@ -5,9 +5,10 @@ Loads the routed hydrographs from bow_at_calgary_lakes.py (calgary_routed.npz),
 aggregates hourly -> daily, aligns with WSC daily-mean discharge at each nested
 mainstem gauge, and reports KGE/NSE plus a multi-panel nested hydrograph figure.
 
-Hydrology note: SUMMA here is uncalibrated and over-produces ~2x, so absolute KGE
-is low; the scientific comparison is baseline vs lakes (peak attenuation / reservoir
-regulation) and the nested multi-gauge structure.
+Hydrology note: the SUMMA runoff has been calibrated (async-DDS), so the routed volumes
+are unbiased and absolute KGE is meaningful at the mainstem gauges; the comparison is
+baseline vs lakes (peak attenuation / reservoir regulation) over the nested multi-gauge
+structure.
 """
 import glob
 import numpy as np
