@@ -27,7 +27,8 @@ D = "/Users/darri.eythorsson/compHydro/SYMFLUENCE_data/domain_Bow_at_Calgary"
 OBS = f"{D}/observations/streamflow"
 RES = "/Users/darri.eythorsson/compHydro/code/dRoute/experiments/results_calgary"
 DT_DAY = 86400.0
-CAL = ("2011-01-01", "2012-12-31")
+ROUTE_START = "2010-01-01"          # 1-yr routing spin-up so lake/subgrid stores equilibrate
+CAL = ("2011-01-01", "2012-12-31")  # evaluation window (spin-up excluded from loss/metrics)
 
 # per-reservoir parameter bounds (operating rule)
 BOUNDS = {
@@ -79,12 +80,20 @@ def load_inputs(runoff_path=None):
         if i is not None:
             seg_runoff[:, i] = np.clip(runoff[:, j], 0, None) * area_by_id.get(int(g), 0.0)
 
-    # hourly -> daily mean lateral inflow (m^3/s)
+    # hourly -> daily mean lateral inflow (m^3/s); route from ROUTE_START (incl. spin-up year)
     daily = pd.DataFrame(seg_runoff, index=time).resample("D").mean()
-    daily = daily.loc[CAL[0]:CAL[1]]
+    daily = daily.loc[ROUTE_START:CAL[1]]
     return dict(seg_ids=seg_ids, id_to_idx=id_to_idx, downstream_idx=downstream_idx,
                 lengths=lengths, slopes=slopes, outlet_idx=outlet_idx,
                 daily_runoff=daily.values, dates=daily.index)
+
+
+def mask_spinup(obs, dates):
+    """Set obs to NaN before the evaluation window so the routing spin-up year is
+    excluded from the loss/metric automatically (kge/dloss_dsim skip NaN obs)."""
+    obs = np.asarray(obs, dtype=float).copy()
+    obs[pd.to_datetime(dates) < pd.Timestamp(CAL[0])] = np.nan
+    return obs
 
 
 def apply_lakes_and_get_reservoirs(net, id_to_idx):
@@ -194,7 +203,7 @@ def main(epochs=60, lr=0.015, seed=0, runoff_path=None):
     print(f"{len(res_idx)} reservoirs at reaches {res_idx} -> {4*len(res_idx)} operating-rule params")
 
     obs = pd.read_csv(f"{OBS}/wsc_05BH004_daily.csv", parse_dates=["date"]).set_index("date")["q_cms"]
-    obs = obs.reindex(inp["dates"]).values
+    obs = mask_spinup(obs.reindex(inp["dates"]).values, inp["dates"])
     runoff = inp["daily_runoff"]; outlet = inp["outlet_idx"]
 
     # init units from current (HydroLAKES-derived) physical values
