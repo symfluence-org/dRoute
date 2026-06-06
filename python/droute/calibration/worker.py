@@ -832,7 +832,12 @@ class DRouteWorker(BaseWorker):
         daily = daily.loc[route_start:eval_end]
 
         import yaml
+        # Prefer an absolute SETTINGS_DROUTE_PATH (set in coupled/parallel runs where the per-process
+        # settings dir doesn't carry droute_lakes.yaml); fall back to the passed settings_dir.
+        droute_settings = self._gv('SETTINGS_DROUTE_PATH')
         lf = Path(settings_dir) / 'droute_lakes.yaml'
+        if droute_settings and (Path(droute_settings) / 'droute_lakes.yaml').exists():
+            lf = Path(droute_settings) / 'droute_lakes.yaml'
         raw = yaml.safe_load(open(lf, encoding='utf-8')) if lf.exists() else {}
         lakes = {'inline': (raw or {}).get('inline_lakes', {}) or {},
                  'subgrid': (raw or {}).get('subgrid_lakes', {}) or {}}
