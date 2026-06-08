@@ -842,8 +842,15 @@ class DRouteWorker(BaseWorker):
         lakes = {'inline': (raw or {}).get('inline_lakes', {}) or {},
                  'subgrid': (raw or {}).get('subgrid_lakes', {}) or {}}
 
-        # gauges from the mapping CSV (station, seg) + WSC daily obs
-        obs_dir = self._gv('MULTI_GAUGE_OBS_DIR') or str(domain / 'observations' / 'streamflow')
+        # gauges from the mapping CSV (station, seg) + WSC daily obs. dRoute's native multi-gauge
+        # layout (gauge_seg_mapping.csv + wsc_<station>_daily.csv) lives under observations/streamflow.
+        # MULTI_GAUGE_OBS_DIR may point at a different layout owned by the land model's metric path
+        # (e.g. LaMAH ID_*.csv in observations/streamflow/lamah_format), so only honour it when it
+        # actually holds dRoute's mapping file; otherwise fall back to observations/streamflow.
+        default_obs = domain / 'observations' / 'streamflow'
+        obs_candidates = [self._gv('DROUTE_OBS_DIR'), self._gv('MULTI_GAUGE_OBS_DIR'), str(default_obs)]
+        obs_dir = next((Path(d) for d in obs_candidates
+                        if d and (Path(d) / 'gauge_seg_mapping.csv').exists()), default_obs)
         gmap = pd.read_csv(Path(obs_dir) / 'gauge_seg_mapping.csv')
         i_eval0 = int(np.argmax(daily.index >= pd.Timestamp(eval_start)))
         rec_dates = daily.index[i_eval0:]
@@ -999,16 +1006,22 @@ class DRouteWorker(BaseWorker):
         z = np.load(Path(output_dir) / 'droute_streamflow.npz', allow_pickle=True)
         Q, obs, stations = z['Q'], z['obs'], z['stations']
         floor = float(self._gv('MULTI_GAUGE_KGE_FLOOR', -2.0))
+        # Optional per-gauge weighting (station -> weight) for the objective. Lets the mean emphasize
+        # a target gauge (e.g. the regulated outlet) while keeping the others as soft constraints.
+        # Absent/empty config -> all weights 1.0, i.e. the original flat mean.
+        weights_cfg = self._gv('MULTI_GAUGE_WEIGHTS', None) or {}
         per = {}
-        kept = []
+        kept = []   # (kge, weight) for gauges above the floor
         for i, st in enumerate(stations):
+            st_s = str(st)
             k = _kge_multigauge(Q[i], obs[i])
-            per[f'KGE_{st}'] = k
+            per[f'KGE_{st_s}'] = k
             if np.isfinite(k) and k >= floor:   # drop volume-biased gauges routing can't fit
-                kept.append(k)
-        mean_kge = float(np.mean(kept)) if kept else floor
+                kept.append((k, float(weights_cfg.get(st_s, 1.0))))
+        wsum = sum(w for _, w in kept)
+        mean_kge = float(sum(k * w for k, w in kept) / wsum) if wsum > 0 else floor
         per['KGE'] = mean_kge
-        per['calib_score'] = mean_kge   # maximization objective
+        per['calib_score'] = mean_kge   # maximization (weighted-mean) objective
         return per
 
     @staticmethod
