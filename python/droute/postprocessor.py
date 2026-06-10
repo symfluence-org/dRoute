@@ -5,16 +5,16 @@
 dRoute model postprocessor.
 
 Handles extraction and processing of dRoute routing simulation results.
-Uses StandardModelPostprocessor for reduced boilerplate.
+Uses StandardModelPostProcessor for reduced boilerplate.
 """
 
 from pathlib import Path
 from typing import Optional
 
-from symfluence.models.base import StandardModelPostprocessor
+from symfluence.models.base import StandardModelPostProcessor
 
 
-class DRoutePostProcessor(StandardModelPostprocessor):
+class DRoutePostProcessor(StandardModelPostProcessor):
     """
     Postprocessor for the dRoute routing model.
 
