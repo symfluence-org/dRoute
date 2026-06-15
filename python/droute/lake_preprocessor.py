@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2024-2026 SYMFLUENCE Team <dev@symfluence.org>
+# Copyright (C) 2025 Darri Eythorsson
 
 """
 dRoute lake pre-processing: HydroLAKES -> spatial classification -> dRoute lake config.
