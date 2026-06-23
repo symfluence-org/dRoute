@@ -55,6 +55,16 @@ def _kge_multigauge(sim: np.ndarray, obs: np.ndarray) -> float:
     return float(1 - np.sqrt((r - 1) ** 2 + (s.std() / o.std() - 1) ** 2 + (s.mean() / o.mean() - 1) ** 2))
 
 
+def _nse_multigauge(sim: np.ndarray, obs: np.ndarray) -> float:
+    """Per-gauge NSE companion to :func:`_kge_multigauge` (same finite-mask + min-overlap contract),
+    so the multi-gauge objective can honour ``OPTIMIZATION_METRIC: NSE`` as well as KGE."""
+    m = np.isfinite(sim) & np.isfinite(obs)
+    s, o = sim[m], obs[m]
+    if len(s) < 10:
+        return np.nan
+    return float(nse(o, s, transfo=1))
+
+
 def build_droute_network(seg_ids, downstream_idx, lengths, slopes, lakes, id_to_idx,
                          per_reach: Optional[Dict[str, List[float]]] = None):
     """Build a dRoute Network with Manning's n + inline/subgrid lake config, optionally overriding
@@ -646,7 +656,12 @@ class DRouteWorker(BaseWorker):
         Returns:
             Dictionary of metric names to values.
         """
-        if self._use_multigauge_path():
+        # A coupled run uses _run_model_multigauge whenever coupling_source_dir is set (not only when
+        # _use_multigauge_path() is True), writing droute_streamflow.npz but never setting _last_routed.
+        # Key the metric path on that artifact so the run and metric paths agree -- otherwise the
+        # single-gauge branch below sees _last_routed is None and returns the penalty score.
+        npz_path = Path(output_dir) / 'droute_streamflow.npz'
+        if self._use_multigauge_path() or npz_path.exists():
             return self._metrics_multigauge(output_dir, config, **kwargs)
 
         try:
@@ -798,9 +813,20 @@ class DRouteWorker(BaseWorker):
         import pandas as pd
         import xarray as xr
 
-        domain = Path(settings_dir).parent.parent
-        rn_path = self._gv('RIVER_NETWORK_SHAPEFILE') or glob.glob(
-            str(domain / 'shapefiles' / 'river_network' / '*.shp'))[0]
+        # Resolve the domain root from config (SYMFLUENCE_DATA_DIR/domain_<DOMAIN_NAME>) rather than
+        # settings_dir.parent.parent: in coupled/parallel runs settings_dir is a per-process dir
+        # (.../process_N/settings/dRoute) whose .parent.parent is the process dir, which carries no
+        # shapefiles/attributes. Fall back to the legacy relative path only when config lacks them.
+        data_dir, domain_name = self._gv('SYMFLUENCE_DATA_DIR'), self._gv('DOMAIN_NAME')
+        domain = (Path(data_dir) / f"domain_{domain_name}"
+                  if data_dir and domain_name else Path(settings_dir).parent.parent)
+        rn_path = self._gv('RIVER_NETWORK_SHAPEFILE')
+        if not rn_path:
+            rn_cands = glob.glob(str(domain / 'shapefiles' / 'river_network' / '*.shp'))
+            if not rn_cands:
+                raise FileNotFoundError(
+                    f"no river network shapefile under {domain / 'shapefiles' / 'river_network'}")
+            rn_path = rn_cands[0]
         rn = gpd.read_file(rn_path)
         seg_ids = rn['LINKNO'].astype(int).values
         id_to_idx = {int(s): i for i, s in enumerate(seg_ids)}
@@ -810,7 +836,11 @@ class DRouteWorker(BaseWorker):
 
         runoff_path = runoff_file or self._gv('DROUTE_RUNOFF_FILE')
         if not runoff_path:
-            runoff_path = glob.glob(str(domain / 'simulations' / '*' / 'SUMMA' / '*_timestep.nc'))[0]
+            ro_cands = glob.glob(str(domain / 'simulations' / '*' / 'SUMMA' / '*_timestep.nc'))
+            if not ro_cands:
+                raise FileNotFoundError(
+                    f"no SUMMA runoff (*_timestep.nc) under {domain / 'simulations'}")
+            runoff_path = ro_cands[0]
         ds = xr.open_dataset(runoff_path)
         runoff = np.clip(ds['averageRoutedRunoff'].values, 0, None)
         gru = ds['gruId'].values.astype(int)
@@ -826,9 +856,31 @@ class DRouteWorker(BaseWorker):
                 seg_runoff[:, i] = runoff[:, jx] * area_by_id.get(int(gid), 0.0)
         cap = float(self._gv('DROUTE_RUNOFF_CAP', 50.0))
         daily = pd.DataFrame(np.clip(seg_runoff, 0, cap), index=time).resample('D').mean()
-        route_start = self._gv('DROUTE_ROUTE_START', '2010-01-01')
-        eval_start = self._gv('CALIBRATION_PERIOD_START', '2011-01-01')
-        eval_end = self._gv('CALIBRATION_PERIOD_END', '2012-12-31')
+        # Calibration window: honour explicit *_START/_END, else parse the combined CALIBRATION_PERIOD.
+        # The normalized config delivers it as a LIST ['start', 'end'] (older flat configs as a
+        # "start, end" string) -- handle both, or extended-period runs silently fall back to the
+        # legacy 2011-2012 default and drop the early calibration years (e.g. the 2005 flood).
+        cal = self._gv('CALIBRATION_PERIOD')
+        if isinstance(cal, (list, tuple)):
+            cal_s, cal_e = (str(cal[0]).strip(), str(cal[1]).strip()) if len(cal) >= 2 else (None, None)
+        else:
+            cal = str(cal or '')
+            cal_s, cal_e = ([p.strip() for p in cal.split(',')[:2]] + [None, None])[:2] if ',' in cal else (None, None)
+        eval_start = self._gv('CALIBRATION_PERIOD_START') or cal_s or '2011-01-01'
+        eval_end = self._gv('CALIBRATION_PERIOD_END') or cal_e or '2012-12-31'
+        # Route from the experiment/spinup start (date only) so routing warms up before eval_start;
+        # the eval window is selected downstream via i_eval0, so earlier routing is harmless.
+        _rs = self._gv('DROUTE_ROUTE_START') or self._gv('EXPERIMENT_TIME_START') or eval_start
+        route_start = str(_rs).split(',')[0].strip().split()[0]
+        # A SUMMA eval that produced no output yields an empty runoff series; fail it cleanly (the
+        # caller scores the penalty) rather than crashing on argmax/min of an empty sequence.
+        if daily.empty:
+            raise ValueError("dRoute received empty SUMMA runoff (0 timesteps): land model produced no output")
+        # Guard against a stale EXPERIMENT_TIME_START default (the config factory defaults it to
+        # '2010-01-01'): never start later than eval_start or the available runoff, or the early
+        # calibration years (e.g. the 2005 flood) get silently clipped out of the window.
+        data_start = str(daily.index.min().date())
+        route_start = min(route_start, str(eval_start).split()[0], data_start)
         daily = daily.loc[route_start:eval_end]
 
         import yaml
@@ -1011,17 +1063,31 @@ class DRouteWorker(BaseWorker):
         # Absent/empty config -> all weights 1.0, i.e. the original flat mean.
         weights_cfg = self._gv('MULTI_GAUGE_WEIGHTS', None) or {}
         per = {}
-        kept = []   # (kge, weight) for gauges above the floor
+        kept = []        # (kge, weight) for gauges above the floor
+        nse_kept = []    # (nse, weight) per gauge for the NSE objective
         for i, st in enumerate(stations):
             st_s = str(st)
+            w = float(weights_cfg.get(st_s, 1.0))
             k = _kge_multigauge(Q[i], obs[i])
+            n = _nse_multigauge(Q[i], obs[i])
             per[f'KGE_{st_s}'] = k
+            per[f'NSE_{st_s}'] = n
             if np.isfinite(k) and k >= floor:   # drop volume-biased gauges routing can't fit
-                kept.append((k, float(weights_cfg.get(st_s, 1.0))))
+                kept.append((k, w))
+            if np.isfinite(n):
+                nse_kept.append((n, w))
         wsum = sum(w for _, w in kept)
         mean_kge = float(sum(k * w for k, w in kept) / wsum) if wsum > 0 else floor
+        nse_wsum = sum(w for _, w in nse_kept)
+        mean_nse = float(sum(n * w for n, w in nse_kept) / nse_wsum) if nse_wsum > 0 else self.penalty_score
+        # Expose both metrics (upper + lowercase aliases) so the optimizer's OPTIMIZATION_METRIC lookup
+        # resolves whether it asks for NSE or KGE; calib_score (the maximization objective) follows it.
         per['KGE'] = mean_kge
-        per['calib_score'] = mean_kge   # maximization (weighted-mean) objective
+        per['NSE'] = mean_nse
+        per['kge'] = mean_kge
+        per['nse'] = mean_nse
+        metric_name = str(self._gv('OPTIMIZATION_METRIC', 'KGE') or 'KGE').upper()
+        per['calib_score'] = mean_nse if metric_name == 'NSE' else mean_kge
         return per
 
     @staticmethod
