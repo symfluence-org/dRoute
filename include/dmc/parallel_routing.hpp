@@ -12,6 +12,9 @@
 #include "kernels_enzyme.hpp"
 #include "advanced_routing.hpp"
 
+#include <map>
+#include <string>
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -241,9 +244,21 @@ public:
         for (int reach_id : topo_order_) {
             lateral_inflows_[reach_id] = to_double(network_.get_reach(reach_id).lateral_inflow);
         }
-        
-        // Route using parallel kernel
-        enzyme::route_network_timestep_parallel(
+
+        // Record the forcing for the Enzyme reverse pass (one row of length n_reaches).
+        if (recording_) {
+            lateral_series_.insert(lateral_series_.end(),
+                                   lateral_inflows_.begin(), lateral_inflows_.end());
+            ++recorded_steps_;
+        }
+
+        // Route in TOPOLOGICAL order (serial). The colored-parallel variant processes reaches
+        // by color group; unless the coloring is topologically layered, a downstream reach can
+        // read a STALE upstream Q_out (previous timestep) instead of the current one, which
+        // diverges ~1-2% from the correct Muskingum-Cunge coupling and, crucially, from the
+        // function the Enzyme adjoint differentiates (simulate_and_compute_loss, also serial).
+        // Routing in topo order makes the forward correct AND consistent with the gradient.
+        enzyme::route_network_timestep(
             n_reaches_,
             topo_order_.data(),
             downstream_idx_.data(),
@@ -258,9 +273,7 @@ public:
             1e-10,  // min_flow
             0.0,    // x_lower
             0.5,    // x_upper
-            Q_out_.data(),
-            coloring_.get_color_groups(),
-            num_threads_
+            Q_out_.data()
         );
         
         // Write back
@@ -285,7 +298,63 @@ public:
     
     int num_colors() const { return coloring_.num_colors(); }
     int num_threads() const { return num_threads_; }
-    
+
+    // --- Enzyme reverse-mode adjoint (multi-timestep) ------------------------
+    // Records the lateral-inflow forcing over the calibration window, then
+    // differentiates the whole simulation loss w.r.t. every reach's Manning n via
+    // Enzyme (source-to-source). No CVODES => numerically robust, unlike the SV path.
+
+    void start_recording() {
+        recording_ = true;
+        recorded_steps_ = 0;
+        lateral_series_.clear();
+        initial_states_ = reach_states_;   // snapshot state at record start (usually zeros)
+    }
+
+    void stop_recording() { recording_ = false; }
+
+    // Gradient of MSE(Q[gauges], observed) over the recorded window w.r.t. each reach's
+    // Manning n. observed_series is flattened [recorded_steps * n_gauges].
+    std::map<std::string, double> compute_gradients(
+        const std::vector<int>& gauge_reaches,
+        const std::vector<double>& observed_series)
+    {
+        std::map<std::string, double> grads;
+        std::vector<double> d_props(n_reaches_ * enzyme::NUM_REACH_PROPS_FULL, 0.0);
+#ifdef DMC_USE_ENZYME
+        enzyme::compute_simulation_gradient_enzyme(
+            n_reaches_, recorded_steps_,
+            topo_order_.data(), downstream_idx_.data(),
+            upstream_counts_.data(), upstream_offsets_.data(), upstream_indices_.data(),
+            reach_props_.data(), d_props.data(),
+            initial_states_.data(), lateral_series_.data(),
+            dt_, num_substeps_, 1e-10, 0.0, 0.5,
+            static_cast<int>(gauge_reaches.size()), gauge_reaches.data(),
+            observed_series.data());
+#endif
+        for (int i = 0; i < n_reaches_; ++i) {
+            grads["reach_" + std::to_string(i) + "_manning_n"] =
+                d_props[i * enzyme::NUM_REACH_PROPS_FULL + 2];   // props[2] = manning_n
+        }
+        return grads;
+    }
+
+    // The EXACT (serial) forward the adjoint differentiates — returns MSE(Q[gauges], observed)
+    // over the recorded window. Lets a Python FD of THIS function validate the adjoint directly
+    // (isolating any serial-vs-parallel forward discrepancy from an actual adjoint bug).
+    double simulate_loss(const std::vector<int>& gauge_reaches,
+                         const std::vector<double>& observed_series)
+    {
+        return enzyme::simulate_and_compute_loss(
+            n_reaches_, recorded_steps_,
+            topo_order_.data(), downstream_idx_.data(),
+            upstream_counts_.data(), upstream_offsets_.data(), upstream_indices_.data(),
+            reach_props_.data(), initial_states_.data(), lateral_series_.data(),
+            dt_, num_substeps_, 1e-10, 0.0, 0.5,
+            static_cast<int>(gauge_reaches.size()), gauge_reaches.data(),
+            observed_series.data());
+    }
+
     // Zero-copy access to output array
     double* get_discharge_ptr() { return Q_out_.data(); }
     const double* get_discharge_ptr() const { return Q_out_.data(); }
@@ -308,6 +377,12 @@ private:
     std::vector<double> reach_states_;
     std::vector<double> lateral_inflows_;
     std::vector<double> Q_out_;
+
+    // Enzyme adjoint recording state
+    bool recording_ = false;
+    int recorded_steps_ = 0;
+    std::vector<double> lateral_series_;   // recorded_steps * n_reaches (row-major by step)
+    std::vector<double> initial_states_;   // state snapshot at start_recording
     
     void initialize_arrays() {
         topo_order_ = network_.topological_order();

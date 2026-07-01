@@ -1610,7 +1610,18 @@ static double routing_objective(
          .def("num_colors", &ParallelEnzymeRouter::num_colors,
              "Number of color groups (parallel batches)")
          .def("num_threads", &ParallelEnzymeRouter::num_threads,
-             "Number of OpenMP threads");
+             "Number of OpenMP threads")
+         .def("start_recording", &ParallelEnzymeRouter::start_recording,
+             "Begin recording the forcing for the Enzyme reverse-mode adjoint")
+         .def("stop_recording", &ParallelEnzymeRouter::stop_recording,
+             "Stop recording the forcing")
+         .def("compute_gradients", &ParallelEnzymeRouter::compute_gradients,
+             "Enzyme adjoint: d MSE(Q[gauges], observed) / d(manning_n) per reach. "
+             "observed_series is flattened [recorded_steps * n_gauges].",
+             py::arg("gauge_reaches"), py::arg("observed_series"))
+         .def("simulate_loss", &ParallelEnzymeRouter::simulate_loss,
+             "The exact (serial) forward the adjoint differentiates: MSE(Q[gauges], observed).",
+             py::arg("gauge_reaches"), py::arg("observed_series"));
  
      // =========================================================================
      // Version info

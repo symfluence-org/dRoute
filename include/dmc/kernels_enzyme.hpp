@@ -1132,10 +1132,14 @@ inline double simulate_and_compute_loss(
     std::vector<double> reach_states(n_reaches * NUM_REACH_STATE);
     std::vector<double> Q_out(n_reaches);
     
-    // Initialize states
-    std::memcpy(reach_states.data(), initial_states, 
-                n_reaches * NUM_REACH_STATE * sizeof(double));
-    
+    // Initialize states. Use a typed element-wise copy rather than std::memcpy: Enzyme
+    // cannot deduce the element type of a runtime-sized byte memcpy when differentiating
+    // this function ("Cannot deduce type of copy"), but a double-typed loop differentiates
+    // cleanly (initial_states is enzyme_const, so this just seeds the working state).
+    for (int i = 0; i < n_reaches * NUM_REACH_STATE; ++i) {
+        reach_states[i] = initial_states[i];
+    }
+
     double total_loss = 0.0;
     
     for (int t = 0; t < n_timesteps; ++t) {
