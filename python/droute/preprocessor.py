@@ -14,8 +14,7 @@ from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, Optional
 
-from symfluence.geospatial.geometry_utils import GeospatialUtilsMixin
-from symfluence.models.base import BaseModelPreProcessor
+from ._symfluence_compat import BaseModelPreProcessor, GeospatialUtilsMixin
 from .mixins import DRouteConfigMixin
 from .network_adapter import DRouteNetworkAdapter
 

@@ -38,8 +38,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from symfluence.core.exceptions import ConfigurationError
-from symfluence.optimization.core.base_parameter_manager import BaseParameterManager
 
+from .._symfluence_compat import BaseParameterManager
 from .bounds import (
     DEFAULT_REGION_PARAMS,
     DROUTE_REGION_PARAM_BOUNDS,
