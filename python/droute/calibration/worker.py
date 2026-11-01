@@ -845,15 +845,21 @@ class DRouteWorker(BaseWorker):
         runoff = np.clip(ds['averageRoutedRunoff'].values, 0, None)
         gru = ds['gruId'].values.astype(int)
         time = pd.to_datetime(ds['time'].values)
+        # averageRoutedRunoff is per GRU (m/s), so it is scaled by the GRU area: the sum of HRUarea over
+        # hru2gruId. Keying HRUarea by hruId only works when every GRU is a single HRU with the same id;
+        # with several HRUs per GRU (e.g. elevation bands) it picks the wrong HRU, or none (area 0).
         attr = xr.open_dataset(domain / 'settings' / 'SUMMA' / 'attributes.nc')
-        area_by_id = {int(h): float(a) for h, a in zip(attr['hruId'].values.astype(int),
-                                                       attr['HRUarea'].values.astype(float))}
+        hru_area = attr['HRUarea'].values.astype(float)
+        hru_gru = attr['hru2gruId'].values.astype(int) if 'hru2gruId' in attr else attr['hruId'].values.astype(int)
+        area_by_gru: Dict[int, float] = {}
+        for g, a in zip(hru_gru, hru_area):
+            area_by_gru[int(g)] = area_by_gru.get(int(g), 0.0) + float(a)
         n_seg = len(seg_ids)
         seg_runoff = np.zeros((len(time), n_seg))
         for jx, gid in enumerate(gru):
             i = id_to_idx.get(int(gid))
             if i is not None:
-                seg_runoff[:, i] = runoff[:, jx] * area_by_id.get(int(gid), 0.0)
+                seg_runoff[:, i] = runoff[:, jx] * area_by_gru.get(int(gid), 0.0)
         cap = float(self._gv('DROUTE_RUNOFF_CAP', 50.0))
         daily = pd.DataFrame(np.clip(seg_runoff, 0, cap), index=time).resample('D').mean()
         # Calibration window: honour explicit *_START/_END, else parse the combined CALIBRATION_PERIOD.
@@ -902,24 +908,59 @@ class DRouteWorker(BaseWorker):
         default_obs = domain / 'observations' / 'streamflow'
         obs_candidates = [self._gv('DROUTE_OBS_DIR'), self._gv('MULTI_GAUGE_OBS_DIR'), str(default_obs)]
         obs_dir = next((Path(d) for d in obs_candidates
-                        if d and (Path(d) / 'gauge_seg_mapping.csv').exists()), default_obs)
-        gmap = pd.read_csv(Path(obs_dir) / 'gauge_seg_mapping.csv')
+                        if d and (Path(d) / 'gauge_seg_mapping.csv').exists()), None)
         i_eval0 = int(np.argmax(daily.index >= pd.Timestamp(eval_start)))
         rec_dates = daily.index[i_eval0:]
-        gauges = []
-        for _, row in gmap.iterrows():
-            seg = int(row['seg']); ridx = id_to_idx.get(seg)
-            if ridx is None:
-                continue
-            o = pd.read_csv(Path(obs_dir) / f"wsc_{row['station']}_daily.csv",
-                            parse_dates=['date']).set_index('date')['q_cms'].reindex(rec_dates).values
-            if np.isfinite(o).sum() >= 10:
-                gauges.append({'station': str(row['station']), 'ridx': int(ridx), 'obs': o.astype(float)})
+        if obs_dir is None:
+            # No multi-gauge layout: score the single project gauge (SYMFLUENCE's preprocessed
+            # streamflow, as the single-gauge path reads it) at the outlet reach.
+            gauge = self._outlet_gauge(domain, domain_name, id_to_idx, downstream_idx, rec_dates)
+            gauges = [gauge] if gauge is not None else []
+        else:
+            gmap = pd.read_csv(Path(obs_dir) / 'gauge_seg_mapping.csv')
+            gauges = []
+            for _, row in gmap.iterrows():
+                seg = int(row['seg']); ridx = id_to_idx.get(seg)
+                if ridx is None:
+                    continue
+                o = pd.read_csv(Path(obs_dir) / f"wsc_{row['station']}_daily.csv",
+                                parse_dates=['date']).set_index('date')['q_cms'].reindex(rec_dates).values
+                if np.isfinite(o).sum() >= 10:
+                    gauges.append({'station': str(row['station']), 'ridx': int(ridx), 'obs': o.astype(float)})
 
         self._inp = dict(seg_ids=seg_ids, id_to_idx=id_to_idx, downstream_idx=downstream_idx,
                          lengths=lengths, slopes=slopes, daily=daily.values, dates=daily.index,
                          i_eval0=i_eval0, lakes=lakes, gauges=gauges, rn_path=rn_path)
         return self._inp
+
+    def _outlet_gauge(self, domain: Path, domain_name: Optional[str], id_to_idx: Dict[int, int],
+                      downstream_idx: np.ndarray, rec_dates) -> Optional[Dict[str, Any]]:
+        """Single-gauge fallback for the multi-gauge path: the project's preprocessed streamflow
+        (``<data>/observations/streamflow/preprocessed/<DOMAIN_NAME>_streamflow_processed.csv``) at
+        reach SIM_REACH_ID, else at the network outlet. Returns None (with an error logged) when the
+        reach or the observations cannot be resolved."""
+        reach = self._gv('SIM_REACH_ID')
+        if reach not in (None, '', 'default') and int(reach) in id_to_idx:
+            ridx = id_to_idx[int(reach)]
+        else:
+            outlets = np.flatnonzero(np.asarray(downstream_idx) < 0)
+            if len(outlets) != 1:
+                self.logger.error(f"dRoute: {len(outlets)} outlet reaches and no SIM_REACH_ID in the "
+                                  "network; set SIM_REACH_ID or provide gauge_seg_mapping.csv")
+                return None
+            ridx = int(outlets[0])
+        obs_file = (resolve_data_subdir(domain, 'observations') / 'streamflow' / 'preprocessed'
+                    / f"{domain_name}_streamflow_processed.csv")
+        if not obs_file.exists():
+            self.logger.error(f"dRoute: no gauge_seg_mapping.csv and no observations at {obs_file}")
+            return None
+        obs = pd.read_csv(obs_file, index_col=0, parse_dates=True).iloc[:, 0]
+        obs = obs.resample('D').mean().reindex(rec_dates).to_numpy(dtype=float)
+        if np.isfinite(obs).sum() < 10:
+            self.logger.error(f"dRoute: fewer than 10 observed days in the calibration window ({obs_file})")
+            return None
+        station = self._gv('STATION_ID') or self._gv('STREAMFLOW_STATION_ID') or 'outlet'
+        return {'station': str(station), 'ridx': ridx, 'obs': obs}
 
     def _run_model_multigauge(self, config: Dict[str, Any], settings_dir: Path, output_dir: Path, **kwargs) -> bool:
         """Coupling-aware, multi-gauge routing. Routes the (fresh) SUMMA runoff through the dRoute
