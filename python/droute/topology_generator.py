@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Dict
 
 import numpy as np
 
-from symfluence.models.utilities.base_topology_generator import BaseTopologyGenerator, TopologyData
+from ._symfluence_compat import BaseTopologyGenerator, TopologyData
 
 if TYPE_CHECKING:
     from droute.preprocessor import DRoutePreProcessor

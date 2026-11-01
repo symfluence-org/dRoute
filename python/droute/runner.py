@@ -15,7 +15,8 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from symfluence.core.exceptions import ModelExecutionError, symfluence_error_handler
-from symfluence.models.base import BaseModelRunner
+
+from ._symfluence_compat import BaseModelRunner
 from .mixins import DRouteConfigMixin
 from .network_adapter import DRouteNetworkAdapter
 
@@ -304,7 +305,7 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         import pandas as pd
         import xarray as xr
 
-        from symfluence.models.utilities.runoff_loader import (
+        from ._symfluence_compat import (
             detect_runoff_variable,
             fix_time_precision,
             resolve_runoff_file,

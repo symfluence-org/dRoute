@@ -24,8 +24,8 @@ import pandas as pd
 
 from symfluence.core.constants import ModelDefaults
 from symfluence.core.mixins.project import resolve_data_subdir
-from symfluence.evaluation.metrics import kge, nse
-from symfluence.optimization.workers.base_worker import BaseWorker, WorkerTask
+
+from .._symfluence_compat import BaseWorker, WorkerTask, kge, nse
 
 # Try to import dRoute
 try:
@@ -43,7 +43,7 @@ def _kge_multigauge(sim: np.ndarray, obs: np.ndarray) -> float:
     """Per-gauge KGE used by the Saint-Venant multi-gauge objective.
 
     Matches the validated standalone routing experiment: drops non-finite pairs and requires at
-    least 10 overlapping points. Kept separate from :func:`symfluence.evaluation.metrics.kge`
+    least 10 overlapping points. Kept separate from :func:`symfluence.core.metrics.metrics.kge`
     (used by the single-gauge Muskingum-Cunge path) so the SV multi-gauge results stay bit-identical
     to the standalone driver.
     """

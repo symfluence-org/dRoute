@@ -11,7 +11,7 @@ Uses StandardModelPostProcessor for reduced boilerplate.
 from pathlib import Path
 from typing import Optional
 
-from symfluence.models.base import StandardModelPostProcessor
+from ._symfluence_compat import StandardModelPostProcessor
 
 
 class DRoutePostProcessor(StandardModelPostProcessor):

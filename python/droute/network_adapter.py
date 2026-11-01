@@ -418,7 +418,7 @@ class DRouteNetworkAdapter:
 
         # Fix cycles using shared algorithm
         elevations = np.array(topology.get('elevations', np.zeros(len(seg_ids_arr))))
-        from symfluence.models.utilities.base_topology_generator import BaseTopologyGenerator
+        from ._symfluence_compat import BaseTopologyGenerator
         fixed_down_ids = BaseTopologyGenerator.fix_routing_cycles(
             seg_ids_arr, down_seg_ids_arr, elevations
         )

@@ -4,7 +4,7 @@
 """dRoute-specific adapter for parameter regionalization (transfer functions).
 
 Wraps the model-agnostic regionalization framework
-(:mod:`symfluence.optimization.regionalization.strategies`) with dRoute defaults and
+(:mod:`symfluence.core.calibration.regionalization.strategies`) with dRoute defaults and
 per-REACH attribute loading from the domain river-network shapefile (and the dRoute lake
 configuration). This is the routing counterpart of ``summa_regionalization`` (which regionalizes
 per-HRU land-surface parameters): here the units are river reaches and the parameters are the
@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from symfluence.optimization.regionalization.strategies import (
+from .._symfluence_compat import (
     ParameterRegionalization,
     RegionalizationFactory,
 )

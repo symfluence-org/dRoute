@@ -21,7 +21,7 @@ try:
 except ImportError:
     HAS_XARRAY = False
 
-from symfluence.models.base import ModelResultExtractor
+from ._symfluence_compat import ModelResultExtractor
 
 
 class DRouteResultExtractor(ModelResultExtractor):

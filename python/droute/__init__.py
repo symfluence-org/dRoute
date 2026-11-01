@@ -47,28 +47,33 @@ __all__ = getattr(
 
 
 def register() -> None:
-    """Register dRoute components with symfluence plugin registry."""
+    """Register dRoute components with symfluence plugin registry.
+
+    Only the config classes are imported here. Execution and calibration
+    classes are registered lazily, so plugin discovery does not import the
+    calibration stack; they are imported on first registry access.
+    """
+    from symfluence.core.registries import Registries as R
     from symfluence.core.registry import model_manifest
     from .config import DRouteConfig, DRouteConfigAdapter
-    from .runner import DRouteRunner
-    from .preprocessor import DRoutePreProcessor
-    from .postprocessor import DRoutePostProcessor
-    from .extractor import DRouteResultExtractor
-    from .calibration.optimizer import DRouteModelOptimizer
-    from .calibration.worker import DRouteWorker
-    from .calibration.parameter_manager import DRouteParameterManager
 
     model_manifest(
         "DROUTE",
         config_adapter=DRouteConfigAdapter,
         config_schema=DRouteConfig,
-        preprocessor=DRoutePreProcessor,
-        runner=DRouteRunner,
-        runner_method='run_droute',
-        postprocessor=DRoutePostProcessor,
-        result_extractor=DRouteResultExtractor,
-        optimizer=DRouteModelOptimizer,
-        worker=DRouteWorker,
-        parameter_manager=DRouteParameterManager,
         build_instructions_module="droute.build_instructions",
+    )
+    base = __name__
+    R.preprocessors.add_lazy("DROUTE", f"{base}.preprocessor.DRoutePreProcessor")
+    R.runners.add_lazy(
+        "DROUTE", f"{base}.runner.DRouteRunner", runner_method="run_droute"
+    )
+    R.postprocessors.add_lazy("DROUTE", f"{base}.postprocessor.DRoutePostProcessor")
+    R.result_extractors.add_lazy("DROUTE", f"{base}.extractor.DRouteResultExtractor")
+    R.optimizers.add_lazy(
+        "DROUTE", f"{base}.calibration.optimizer.DRouteModelOptimizer"
+    )
+    R.workers.add_lazy("DROUTE", f"{base}.calibration.worker.DRouteWorker")
+    R.parameter_managers.add_lazy(
+        "DROUTE", f"{base}.calibration.parameter_manager.DRouteParameterManager"
     )
