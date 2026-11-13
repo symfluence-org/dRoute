@@ -103,6 +103,58 @@ class DRouteConfigMixin:
         )
 
     # =========================================================================
+    # Hydrofabric layers (transfers, lakes)
+    # =========================================================================
+
+    @property
+    def droute_transfers_file(self) -> str:
+        """transfers.csv path, 'default' (next to topology) or 'none'."""
+        return str(self._get_config_value(
+            lambda: self.config.model.droute.transfers_file,
+            default='default'
+        ))
+
+    @property
+    def droute_lakes_file(self) -> str:
+        """lakes.csv path, 'default' (next to topology) or 'none'."""
+        return str(self._get_config_value(
+            lambda: self.config.model.droute.lakes_file,
+            default='default'
+        ))
+
+    @property
+    def droute_enable_groundwater_transfers(self) -> bool:
+        """Apply groundwater transfer edges (off by default)."""
+        return bool(self._get_config_value(
+            lambda: self.config.model.droute.enable_groundwater_transfers,
+            default=False
+        ))
+
+    @property
+    def droute_transfer_capacity_factor(self) -> float:
+        """Default capacity = factor * prior mean flow at the source unit."""
+        return float(self._get_config_value(
+            lambda: self.config.model.droute.transfer_capacity_factor,
+            default=1.0
+        ))
+
+    @property
+    def droute_bifurcation_fraction(self) -> float:
+        """Default natural_bifurcation fraction."""
+        return float(self._get_config_value(
+            lambda: self.config.model.droute.bifurcation_fraction,
+            default=0.25
+        ))
+
+    @property
+    def droute_lake_weir_c(self) -> float:
+        """Default level-pool weir coefficient C_w."""
+        return float(self._get_config_value(
+            lambda: self.config.model.droute.lake_weir_c,
+            default=1.7
+        ))
+
+    # =========================================================================
     # Integration Configuration
     # =========================================================================
 

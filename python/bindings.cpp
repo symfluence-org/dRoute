@@ -36,6 +36,8 @@
  #include <dmc/router.hpp>
  #include <dmc/advanced_routing.hpp>
  #include <dmc/network.hpp>
+ #include <dmc/transfers.hpp>
+ #include <dmc/transfer_routing.hpp>
  #include <dmc/network_io.hpp>
  #include <dmc/unified_router.hpp>
  #include <dmc/saint_venant_router.hpp>
@@ -431,7 +433,138 @@ static double routing_objective(
          .def_property_readonly("grad_subgrid_q_ref",
              [](const Reach& r) { return r.grad_subgrid_q_ref; }, "Gradient w.r.t. subgrid_q_ref")
          .def_property_readonly("grad_subgrid_exp",
-             [](const Reach& r) { return r.grad_subgrid_exp; }, "Gradient w.r.t. subgrid_exp");
+             [](const Reach& r) { return r.grad_subgrid_exp; }, "Gradient w.r.t. subgrid_exp")
+
+         // ===== Level-pool lake node =====
+         .def_readwrite("lake_model", &Reach::lake_model,
+             "Lake routing model: 0 = storage-fraction rating curve, 1 = level-pool weir")
+         .def_property("lake_weir_coef",
+             [](const Reach& r) { return to_double(r.lake_weir_coef); },
+             [](Reach& r, double v) { r.lake_weir_coef = Real(v); },
+             "Level-pool weir coefficient C_w*B [m^1.5/s] (learnable)")
+         .def_property("lake_weir_exp",
+             [](const Reach& r) { return to_double(r.lake_weir_exp); },
+             [](Reach& r, double v) { r.lake_weir_exp = Real(v); },
+             "Level-pool weir exponent (learnable, default 1.5)")
+         .def_readwrite("lake_min_storage", &Reach::lake_min_storage,
+             "Lowest storage relative to the crest reachable by withdrawals [m^3] (<= 0)")
+         .def_property_readonly("grad_lake_weir_coef",
+             [](const Reach& r) { return r.grad_lake_weir_coef; }, "Gradient w.r.t. lake_weir_coef")
+         .def_property_readonly("grad_lake_weir_exp",
+             [](const Reach& r) { return r.grad_lake_weir_exp; }, "Gradient w.r.t. lake_weir_exp")
+
+         // ===== Transfer fluxes of the last step =====
+         .def_property_readonly("transfer_in",
+             [](const Reach& r) { return to_double(r.transfer_in); },
+             "Water delivered to this reach by transfers in the last step [m^3/s]")
+         .def_property_readonly("transfer_out",
+             [](const Reach& r) { return to_double(r.transfer_out); },
+             "Water withdrawn from this reach by transfers in the last step [m^3/s]")
+         .def_property_readonly("net_outflow",
+             [](const Reach& r) { return to_double(r.net_outflow()); },
+             "Outflow passed downstream (outflow - transfer_out) [m^3/s]");
+
+     m.attr("LAKE_RATING_CURVE") = LAKE_RATING_CURVE;
+     m.attr("LAKE_LEVEL_POOL") = LAKE_LEVEL_POOL;
+
+     // =========================================================================
+     // Transfers (non-tree edges)
+     // =========================================================================
+     py::enum_<TransferType>(m, "TransferType", "Type of a transfer edge")
+         .value("headrace", TransferType::Headrace)
+         .value("diversion", TransferType::Diversion)
+         .value("natural_bifurcation", TransferType::NaturalBifurcation)
+         .value("groundwater", TransferType::Groundwater);
+
+     m.def("parse_transfer_type", &parse_transfer_type, py::arg("name"),
+         "Parse 'headrace' | 'diversion' | 'natural_bifurcation' | 'groundwater'");
+
+     py::class_<Transfer>(m, "Transfer",
+         "Directed transfer edge: withdraws from from_reach's outflow (or lake storage) "
+         "and adds to to_reach's inflow")
+         .def(py::init<>())
+         .def_readwrite("id", &Transfer::id)
+         .def_readwrite("type", &Transfer::type)
+         .def_readwrite("operated", &Transfer::operated)
+         .def_readwrite("from_reach", &Transfer::from_reach)
+         .def_readwrite("to_reach", &Transfer::to_reach,
+             "Receiving reach id; -1 = water leaves the system (declared loss)")
+         .def_property("fraction",
+             [](const Transfer& t) { return to_double(t.fraction); },
+             [](Transfer& t, double v) { t.fraction = Real(v); },
+             "Share of the reference flow withdrawn [0,1] (learnable)")
+         .def_property("capacity",
+             [](const Transfer& t) -> py::object {
+                 if (!t.has_capacity) return py::none();
+                 return py::float_(to_double(t.capacity));
+             },
+             [](Transfer& t, py::object v) {
+                 if (v.is_none()) { t.has_capacity = false; t.capacity = Real(0.0); }
+                 else { t.has_capacity = true; t.capacity = Real(v.cast<double>()); }
+             },
+             "Maximum withdrawal [m^3/s] (learnable); None = unlimited")
+         .def_property("gw_k",
+             [](const Transfer& t) { return to_double(t.gw_k); },
+             [](Transfer& t, double v) { t.gw_k = Real(v); },
+             "Groundwater store residence time [s] (learnable)")
+         .def_readwrite("commissioned", &Transfer::commissioned,
+             "First (fractional) year the edge is active; NaN = always")
+         .def_readwrite("decommissioned", &Transfer::decommissioned,
+             "Year from which the edge is inactive; NaN = never")
+         .def_readwrite("from_storage", &Transfer::from_storage,
+             "Withdraw from the source lake's storage (reservoir operation)")
+         .def_readwrite("enabled", &Transfer::enabled)
+         .def_readwrite("rule", &Transfer::rule,
+             "Operating rule: callable(year, time_s, q_available) -> max withdrawal [m^3/s] "
+             "or NaN for no constraint")
+         .def_property_readonly("last_flow",
+             [](const Transfer& t) { return to_double(t.last_flow); },
+             "Withdrawal in the last step [m^3/s]")
+         .def_property("gw_store",
+             [](const Transfer& t) { return to_double(t.gw_store); },
+             [](Transfer& t, double v) { t.gw_store = Real(v); },
+             "Groundwater store [m^3]")
+         .def_readonly("grad_fraction", &Transfer::grad_fraction)
+         .def_readonly("grad_capacity", &Transfer::grad_capacity)
+         .def_readonly("grad_gw_k", &Transfer::grad_gw_k)
+         .def("__repr__", [](const Transfer& t) {
+             return "<Transfer " + t.id + " " + transfer_type_name(t.type) + " " +
+                    std::to_string(t.from_reach) + "->" + std::to_string(t.to_reach) + ">";
+         });
+
+     py::class_<TransferOptions>(m, "TransferOptions", "Global switches for transfer edges")
+         .def(py::init<>())
+         .def_readwrite("sim_start_year", &TransferOptions::sim_start_year,
+             "Calendar year at simulation time 0; NaN ignores commissioning dates")
+         .def_readwrite("enable_groundwater", &TransferOptions::enable_groundwater,
+             "Apply groundwater edges (hypotheses, off by default)");
+
+     py::class_<MassBalance>(m, "MassBalance",
+         "Cumulative water balance [m^3]: input = terminal_outflow + declared_losses + "
+         "storage changes + residual")
+         .def(py::init<>())
+         .def_readonly("input", &MassBalance::input)
+         .def_readonly("terminal_outflow", &MassBalance::terminal_outflow)
+         .def_readonly("declared_losses", &MassBalance::declared_losses)
+         .def_readonly("lake_storage_change", &MassBalance::lake_storage_change)
+         .def_readonly("groundwater_storage_change", &MassBalance::groundwater_storage_change)
+         .def_readonly("channel_storage_change", &MassBalance::channel_storage_change)
+         .def_readonly("residual", &MassBalance::residual)
+         .def_readonly("relative_residual", &MassBalance::relative_residual)
+         .def_readonly("elapsed_time", &MassBalance::elapsed_time)
+         .def("as_dict", [](const MassBalance& mb) {
+             py::dict d;
+             d["input"] = mb.input;
+             d["terminal_outflow"] = mb.terminal_outflow;
+             d["declared_losses"] = mb.declared_losses;
+             d["lake_storage_change"] = mb.lake_storage_change;
+             d["groundwater_storage_change"] = mb.groundwater_storage_change;
+             d["channel_storage_change"] = mb.channel_storage_change;
+             d["residual"] = mb.residual;
+             d["relative_residual"] = mb.relative_residual;
+             d["elapsed_time"] = mb.elapsed_time;
+             return d;
+         });
  
      // =========================================================================
      // Junction
@@ -470,6 +603,29 @@ static double routing_objective(
          
          // Gradients
          .def("zero_gradients", &Network::zero_gradients, "Reset all gradients to zero")
+         .def("get_parameter_names", &Network::get_parameter_names,
+             "Names of all AD parameters (channel, lake and transfer)")
+
+         // Transfers and terminals
+         .def("add_transfer", &Network::add_transfer, py::arg("transfer"),
+             "Add a transfer edge (call build_topology() afterwards)")
+         .def("get_transfer", &Network::get_transfer, py::arg("id"),
+             py::return_value_policy::reference_internal, "Get a transfer edge by id")
+         .def("transfer_ids", [](const Network& net) {
+             std::vector<std::string> ids;
+             for (const auto& t : net.transfers()) ids.push_back(t.id);
+             return ids;
+         }, "Ids of all transfer edges (in processing order)")
+         .def("num_transfers", [](const Network& net) { return net.transfers().size(); })
+         .def("clear_transfers", &Network::clear_transfers)
+         .def_property_readonly("transfer_options",
+             py::overload_cast<>(&Network::transfer_options),
+             py::return_value_policy::reference_internal,
+             "Global transfer switches (sim_start_year, enable_groundwater)")
+         .def("terminal_reaches", &Network::terminal_reaches,
+             "Reaches whose outflow leaves the tree (sea or sink outlets)")
+         .def("has_extensions", &Network::has_extensions,
+             "True when transfers or level-pool lakes are present")
          
          // Bulk operations for efficiency
          .def("set_manning_n_all", [](Network& net, py::array_t<double> values) {
@@ -597,6 +753,13 @@ static double routing_objective(
              py::arg("reach_id"))
          .def("get_all_discharges", &MuskingumCungeRouter::get_all_discharges,
              "Get discharges at all reaches")
+         .def("get_net_discharge", &MuskingumCungeRouter::get_net_discharge,
+             "Discharge passed downstream (after transfer withdrawals)", py::arg("reach_id"))
+         .def("mass_balance", &MuskingumCungeRouter::mass_balance,
+             "Cumulative water balance since creation / reset_mass_balance()")
+         .def("reset_mass_balance", &MuskingumCungeRouter::reset_mass_balance)
+         .def("channel_storage", &MuskingumCungeRouter::channel_storage,
+             "Muskingum channel storage estimate [m^3]")
          .def("reset_state", &MuskingumCungeRouter::reset_state,
              "Reset router state")
          
@@ -706,6 +869,10 @@ static double routing_objective(
              py::arg("inflows"))
          .def("get_discharge", &IRFRouter::get_discharge, py::arg("reach_id"))
          .def("get_all_discharges", &IRFRouter::get_all_discharges)
+         .def("get_net_discharge", &IRFRouter::get_net_discharge, py::arg("reach_id"))
+         .def("mass_balance", &IRFRouter::mass_balance)
+         .def("reset_mass_balance", &IRFRouter::reset_mass_balance)
+         .def("channel_storage", &IRFRouter::channel_storage)
          .def("reset_state", &IRFRouter::reset_state)
          .def("current_time", &IRFRouter::current_time);
  

@@ -195,6 +195,7 @@ private:
 inline DiffusiveWaveIFT::DiffusiveWaveIFT(Network& network, RouterConfig config)
     : network_(network), config_(std::move(config)) {
     network_.build_topology();
+    network_.require_tree_only("DiffusiveWaveIFT");
     nodes_per_reach_ = config_.dw_num_nodes;
     initialize();
 }
@@ -658,6 +659,7 @@ public:
 inline SoftGatedKWT::SoftGatedKWT(Network& network, RouterConfig config)
     : network_(network), config_(std::move(config)) {
     network_.build_topology();
+    network_.require_tree_only("SoftGatedKWT");
     
     // Initialize steepness from config
     gate_steepness_ = config_.kwt_gate_steepness;

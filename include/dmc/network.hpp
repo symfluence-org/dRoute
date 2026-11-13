@@ -2,12 +2,16 @@
 #define DMC_ROUTE_NETWORK_HPP
 
 #include "types.hpp"
+#include "transfers.hpp"
 #include <vector>
 #include <string>
 #include <unordered_map>
 #include <memory>
 #include <queue>
 #include <algorithm>
+#include <sstream>
+#include <stdexcept>
+#include <unordered_set>
 
 namespace dmc {
 
@@ -141,7 +145,32 @@ struct Reach {
     Real subgrid_exp = 1.0;              // rating exponent (learnable)
     double grad_subgrid_q_ref = 0.0;
     double grad_subgrid_exp = 0.0;
+
+    // ===== Level-pool lake node (lake_model == LAKE_LEVEL_POOL) =====
+    // Storage S [m^3] is measured relative to the outlet crest, so the stage
+    // above the crest is h = max(S, 0) / lake_area and the outflow over the
+    // crest is a weir relation Q = lake_weir_coef * h^lake_weir_exp.
+    // Operated withdrawals (transfers with from_storage) may draw the lake
+    // down to lake_min_storage (<= 0, i.e. below the crest).
+    int  lake_model = 0;            // 0 = storage-fraction rating curve, 1 = level-pool weir
+    Real lake_weir_coef = 1.7 * 10.0;  // C_w * crest width [m^1.5/s] (learnable)
+    Real lake_weir_exp = 1.5;          // weir exponent (learnable)
+    double lake_min_storage = 0.0;     // lowest storage reachable by withdrawals [m^3] (<= 0)
+    double grad_lake_weir_coef = 0.0;
+    double grad_lake_weir_exp = 0.0;
+
+    // ===== Transfer bookkeeping (per timestep) =====
+    // transfer_out: total withdrawn from this reach's outflow/storage [m^3/s];
+    // the flow passed to the downstream reach is outflow_curr - transfer_out.
+    // transfer_in: total delivered to this reach's inflow by transfer edges.
+    Real transfer_in = 0.0;
+    Real transfer_out = 0.0;
+
+    Real net_outflow() const { return outflow_curr - transfer_out; }
 };
+
+constexpr int LAKE_RATING_CURVE = 0;
+constexpr int LAKE_LEVEL_POOL = 1;
 
 /**
  * A junction where reaches meet.
@@ -186,6 +215,28 @@ public:
     size_t num_reaches() const { return reaches_.size(); }
     size_t num_junctions() const { return junctions_.size(); }
     
+    // Reaches whose outflow is not routed into any other reach (tree outlets:
+    // sea or sink). Computed by build_topology().
+    const std::vector<int>& terminal_reaches() const { return terminal_reaches_; }
+
+    // ===== Transfers (non-tree edges) =====
+    void add_transfer(Transfer transfer);
+    std::vector<Transfer>& transfers() { return transfers_; }
+    const std::vector<Transfer>& transfers() const { return transfers_; }
+    Transfer& get_transfer(const std::string& id);
+    void clear_transfers() { transfers_.clear(); }
+    TransferOptions& transfer_options() { return transfer_options_; }
+    const TransferOptions& transfer_options() const { return transfer_options_; }
+
+    // True when the network uses transfers or level-pool lake nodes, which only
+    // the Muskingum-Cunge and IRF routers support.
+    bool has_extensions() const;
+
+    // Throw a clear error from routers that do not support the extensions.
+    void require_tree_only(const std::string& router_name) const;
+
+    bool has_reach(int id) const { return reaches_.count(id) > 0; }
+
     // Parameter access for AD
     std::vector<Real*> get_all_parameters();
     std::vector<std::string> get_parameter_names();
@@ -202,6 +253,9 @@ private:
     std::unordered_map<int, Reach> reaches_;
     std::unordered_map<int, Junction> junctions_;
     std::vector<int> topo_order_;  // Reach IDs in topological order
+    std::vector<int> terminal_reaches_;
+    std::vector<Transfer> transfers_;
+    TransferOptions transfer_options_;
     
     void compute_topological_order();
 };
@@ -235,7 +289,10 @@ inline const Junction& Network::get_junction(int id) const {
 inline std::vector<Real*> Network::get_all_parameters() {
     std::vector<Real*> params;
     for (auto& [id, reach] : reaches_) {
-        if (reach.is_lake) {
+        if (reach.is_lake && reach.lake_model == LAKE_LEVEL_POOL) {
+            params.push_back(&reach.lake_weir_coef);
+            params.push_back(&reach.lake_weir_exp);
+        } else if (reach.is_lake) {
             // Learnable lake/reservoir rating-curve parameters
             params.push_back(&reach.lake_q_ref);
             params.push_back(&reach.lake_exp);
@@ -253,6 +310,11 @@ inline std::vector<Real*> Network::get_all_parameters() {
             }
         }
     }
+    for (auto& t : transfers_) {
+        params.push_back(&t.fraction);
+        if (t.has_capacity) params.push_back(&t.capacity);
+        if (t.is_groundwater()) params.push_back(&t.gw_k);
+    }
     return params;
 }
 
@@ -260,7 +322,10 @@ inline std::vector<std::string> Network::get_parameter_names() {
     std::vector<std::string> names;
     for (auto& [id, reach] : reaches_) {
         std::string prefix = "reach_" + std::to_string(id) + "_";
-        if (reach.is_lake) {
+        if (reach.is_lake && reach.lake_model == LAKE_LEVEL_POOL) {
+            names.push_back(prefix + "lake_weir_coef");
+            names.push_back(prefix + "lake_weir_exp");
+        } else if (reach.is_lake) {
             names.push_back(prefix + "lake_q_ref");
             names.push_back(prefix + "lake_exp");
             names.push_back(prefix + "lake_q_min");
@@ -277,12 +342,21 @@ inline std::vector<std::string> Network::get_parameter_names() {
             }
         }
     }
+    for (const auto& t : transfers_) {
+        std::string prefix = "transfer_" + t.id + "_";
+        names.push_back(prefix + "fraction");
+        if (t.has_capacity) names.push_back(prefix + "capacity");
+        if (t.is_groundwater()) names.push_back(prefix + "gw_k");
+    }
     return names;
 }
 
 inline void Network::collect_gradients() {
     for (auto& [id, reach] : reaches_) {
-        if (reach.is_lake) {
+        if (reach.is_lake && reach.lake_model == LAKE_LEVEL_POOL) {
+            reach.grad_lake_weir_coef = get_gradient(reach.lake_weir_coef);
+            reach.grad_lake_weir_exp = get_gradient(reach.lake_weir_exp);
+        } else if (reach.is_lake) {
             reach.grad_lake_q_ref = get_gradient(reach.lake_q_ref);
             reach.grad_lake_exp = get_gradient(reach.lake_exp);
             reach.grad_lake_q_min = get_gradient(reach.lake_q_min);
@@ -299,6 +373,11 @@ inline void Network::collect_gradients() {
             }
         }
     }
+    for (auto& t : transfers_) {
+        t.grad_fraction = get_gradient(t.fraction);
+        t.grad_capacity = t.has_capacity ? get_gradient(t.capacity) : 0.0;
+        t.grad_gw_k = t.is_groundwater() ? get_gradient(t.gw_k) : 0.0;
+    }
 }
 
 inline void Network::zero_gradients() {
@@ -308,6 +387,13 @@ inline void Network::zero_gradients() {
         reach.grad_width_exp = 0.0;
         reach.grad_depth_coef = 0.0;
         reach.grad_depth_exp = 0.0;
+        reach.grad_lake_weir_coef = 0.0;
+        reach.grad_lake_weir_exp = 0.0;
+    }
+    for (auto& t : transfers_) {
+        t.grad_fraction = 0.0;
+        t.grad_capacity = 0.0;
+        t.grad_gw_k = 0.0;
     }
 }
 
@@ -353,6 +439,30 @@ inline void Network::compute_topological_order() {
         }
     }
     
+    // Terminal reaches: not routed into any other reach by the tree.
+    {
+        std::unordered_set<int> has_downstream;
+        for (const auto& [down_id, ups] : upstream_reaches) {
+            for (int u : ups) has_downstream.insert(u);
+        }
+        terminal_reaches_.clear();
+        for (const auto& [reach_id, reach] : reaches_) {
+            if (!has_downstream.count(reach_id)) terminal_reaches_.push_back(reach_id);
+        }
+        std::sort(terminal_reaches_.begin(), terminal_reaches_.end());
+    }
+
+    // Transfer edges: the receiving reach must be processed after the source
+    // reach in the same timestep, so they join the dependency graph.
+    for (const auto& t : transfers_) {
+        if (t.to_reach < 0 || !reaches_.count(t.to_reach) || !reaches_.count(t.from_reach)) continue;
+        auto& deps = upstream_reaches[t.to_reach];
+        if (std::find(deps.begin(), deps.end(), t.from_reach) == deps.end()) {
+            deps.push_back(t.from_reach);
+            in_degree[t.to_reach]++;
+        }
+    }
+
     // Kahn's algorithm for topological sort
     std::queue<int> queue;
     
@@ -378,6 +488,41 @@ inline void Network::compute_topological_order() {
         }
     }
     
+    // With transfer edges a cycle is a modelling error: reject it.
+    if (topo_order_.size() != reaches_.size() && !transfers_.empty()) {
+        // Peel off reaches that are merely downstream of the cycle so the
+        // message names the reaches that actually form it.
+        std::unordered_set<int> remaining;
+        for (const auto& [rid, deg] : in_degree) if (deg > 0) remaining.insert(rid);
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            std::unordered_set<int> feeds;
+            for (int rid : remaining) {
+                auto it = upstream_reaches.find(rid);
+                if (it == upstream_reaches.end()) continue;
+                for (int u : it->second) if (remaining.count(u)) feeds.insert(u);
+            }
+            for (auto it = remaining.begin(); it != remaining.end();) {
+                if (!feeds.count(*it)) { it = remaining.erase(it); changed = true; }
+                else ++it;
+            }
+        }
+        std::vector<int> cyc(remaining.begin(), remaining.end());
+        std::sort(cyc.begin(), cyc.end());
+        std::ostringstream msg;
+        msg << "Network contains a cycle once transfer edges are added (tree + transfers must be acyclic). "
+            << cyc.size() << " reaches involved:";
+        for (size_t i = 0; i < cyc.size() && i < 20; ++i) msg << " " << cyc[i];
+        if (cyc.size() > 20) msg << " ...";
+        msg << ". Transfers on the cycle:";
+        for (const auto& t : transfers_) {
+            if (remaining.count(t.from_reach) && remaining.count(t.to_reach)) msg << " " << t.id;
+        }
+        topo_order_.clear();
+        throw std::runtime_error(msg.str());
+    }
+
     // Fall back to simple ordering if cycle detected
     if (topo_order_.size() != reaches_.size()) {
         topo_order_.clear();
@@ -385,6 +530,49 @@ inline void Network::compute_topological_order() {
             topo_order_.push_back(reach_id);
         }
         std::sort(topo_order_.begin(), topo_order_.end());
+    }
+}
+
+inline void Network::add_transfer(Transfer transfer) {
+    if (!reaches_.count(transfer.from_reach)) {
+        throw std::invalid_argument("Transfer '" + transfer.id + "': from_reach " +
+                                    std::to_string(transfer.from_reach) + " is not in the network");
+    }
+    if (transfer.to_reach >= 0 && !reaches_.count(transfer.to_reach)) {
+        throw std::invalid_argument("Transfer '" + transfer.id + "': to_reach " +
+                                    std::to_string(transfer.to_reach) + " is not in the network");
+    }
+    if (transfer.to_reach == transfer.from_reach) {
+        throw std::invalid_argument("Transfer '" + transfer.id + "' starts and ends at the same reach");
+    }
+    for (const auto& t : transfers_) {
+        if (t.id == transfer.id) {
+            throw std::invalid_argument("Duplicate transfer id '" + transfer.id + "'");
+        }
+    }
+    transfers_.push_back(std::move(transfer));
+}
+
+inline Transfer& Network::get_transfer(const std::string& id) {
+    for (auto& t : transfers_) {
+        if (t.id == id) return t;
+    }
+    throw std::out_of_range("No transfer with id '" + id + "'");
+}
+
+inline bool Network::has_extensions() const {
+    if (!transfers_.empty()) return true;
+    for (const auto& [id, reach] : reaches_) {
+        if (reach.is_lake && reach.lake_model == LAKE_LEVEL_POOL) return true;
+    }
+    return false;
+}
+
+inline void Network::require_tree_only(const std::string& router_name) const {
+    if (has_extensions()) {
+        throw std::runtime_error(router_name +
+            " is not supported with transfers or level-pool lake nodes; "
+            "use MuskingumCungeRouter or IRFRouter");
     }
 }
 

@@ -296,6 +296,7 @@ inline SaintVenantRouter::SaintVenantRouter(Network& network, SaintVenantConfig 
     : network_(network), config_(std::move(config)) {
     
     network_.build_topology();
+    network_.require_tree_only("SaintVenantRouter");
     
     int n_reaches = network_.topological_order().size();
     int n_nodes = config_.n_nodes;

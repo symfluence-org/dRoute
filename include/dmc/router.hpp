@@ -3,6 +3,7 @@
 
 #include "types.hpp"
 #include "network.hpp"
+#include "transfer_routing.hpp"
 #include <vector>
 #include <deque>
 #include <functional>
@@ -232,6 +233,19 @@ struct RouterState {
 };
 
 /**
+ * Add transfer-parameter gradients ("transfer_<id>_fraction", ...) to a map.
+ */
+inline void add_transfer_gradients(const Network& net,
+                                   std::unordered_map<std::string, double>& grads) {
+    for (const auto& t : net.transfers()) {
+        std::string prefix = "transfer_" + t.id + "_";
+        grads[prefix + "fraction"] = t.grad_fraction;
+        if (t.has_capacity) grads[prefix + "capacity"] = t.grad_capacity;
+        if (t.is_groundwater()) grads[prefix + "gw_k"] = t.grad_gw_k;
+    }
+}
+
+/**
  * Core Muskingum-Cunge routing engine.
  * 
  * Supports automatic differentiation for parameter learning.
@@ -379,6 +393,26 @@ public:
      * Get discharge at all reaches (same order as topological order).
      */
     std::vector<double> get_all_discharges() const;
+
+    /**
+     * Discharge passed downstream from a reach: outflow minus transfer
+     * withdrawals (equals get_discharge when the reach has no transfers).
+     */
+    double get_net_discharge(int reach_id) const;
+
+    // =========== Mass balance ===========
+
+    /**
+     * Cumulative water balance since the router was created or
+     * reset_mass_balance() was called.
+     */
+    MassBalance mass_balance() const;
+    void reset_mass_balance();
+
+    /**
+     * Channel storage estimate from the Muskingum relation S = K(XI + (1-X)O).
+     */
+    double channel_storage() const;
     
     /**
      * Reset state to initial conditions.
@@ -429,6 +463,10 @@ private:
     // Timeseries output storage: reach_id -> vector of outputs per timestep
     // These Real values are recorded on the tape for backpropagation
     std::unordered_map<int, std::vector<Real>> output_history_;
+
+    // Water balance bookkeeping
+    transfer_ops::MassBalanceTracker mass_balance_;
+    bool use_transfers_ = false;
     
     /**
      * Compute inflow to a reach from upstream junction.
@@ -519,8 +557,17 @@ inline void MuskingumCungeRouter::compute_routing_coefficients(
 
 inline Real MuskingumCungeRouter::compute_reach_inflow(const Reach& reach) {
     if (reach.upstream_junction_id < 0) {
-        // Headwater - no upstream inflow
-        return Real(0.0);
+        // Headwater - no upstream inflow (but possibly transferred water)
+        return use_transfers_ ? Real(reach.transfer_in) : Real(0.0);
+    }
+    if (use_transfers_) {
+        Real inflow = reach.transfer_in;
+        const Junction& junc = network_.get_junction(reach.upstream_junction_id);
+        inflow = inflow + junc.external_inflow;
+        for (int up_reach_id : junc.upstream_reach_ids) {
+            inflow = inflow + network_.get_reach(up_reach_id).net_outflow();
+        }
+        return inflow;
     }
     
     const Junction& junc = network_.get_junction(reach.upstream_junction_id);
@@ -675,14 +722,28 @@ inline Real MuskingumCungeRouter::apply_subgrid_lake(Reach& reach, double dt) {
 }
 
 inline void MuskingumCungeRouter::route_timestep() {
-    // Process reaches in topological order
+    if (!mass_balance_.initialized()) mass_balance_.reset(network_, channel_storage());
+    mass_balance_.add_input(network_, config_.dt);
+
+    // Transfers: clear per-step fluxes and release lagged (groundwater) stores
+    use_transfers_ = !network_.transfers().empty();
+    double losses = 0.0;
+    const double year = time_to_year(network_.transfer_options(), current_time_);
+    transfer_ops::TransferIndex tindex = transfer_ops::begin_step(network_, config_.dt, losses);
+    const int lake_nsub = (config_.num_substeps > 1) ? config_.num_substeps : 4;
+
+    // Process reaches in topological order (tree + transfer edges)
     for (int reach_id : network_.topological_order()) {
         Reach& reach = network_.get_reach(reach_id);
         
         // Update inflow from upstream
         reach.inflow_curr = compute_reach_inflow(reach);
 
-        if (reach.is_lake) {
+        if (reach.is_lake && reach.lake_model == LAKE_LEVEL_POOL) {
+            reach.outflow_curr = transfer_ops::route_level_pool(
+                network_, reach, reach.inflow_curr + reach.lateral_inflow, config_.dt,
+                lake_nsub, tindex, year, current_time_, losses);
+        } else if (reach.is_lake) {
             reach.outflow_curr = route_lake(reach, config_.dt);
         } else {
             // optional subgrid (off-network) lake attenuation of local runoff
@@ -691,7 +752,15 @@ inline void MuskingumCungeRouter::route_timestep() {
             }
             reach.outflow_curr = route_reach(reach, config_.dt);
         }
+
+        // Withdraw from this reach's outflow before downstream inflow is summed
+        if (use_transfers_) {
+            transfer_ops::apply_outflow_transfers(network_, reach, tindex, year,
+                                                  current_time_, config_.dt, losses);
+        }
     }
+    mass_balance_.add_losses(losses);
+    mass_balance_.add_terminal(network_, config_.dt, /*trapezoid=*/true);
 
     // Advance state: current becomes previous
     for (int reach_id : network_.topological_order()) {
@@ -886,7 +955,10 @@ inline std::unordered_map<std::string, double> MuskingumCungeRouter::get_gradien
         const Reach& reach = network_.get_reach(reach_id);
         std::string prefix = "reach_" + std::to_string(reach_id) + "_";
 
-        if (reach.is_lake) {
+        if (reach.is_lake && reach.lake_model == LAKE_LEVEL_POOL) {
+            grads[prefix + "lake_weir_coef"] = reach.grad_lake_weir_coef;
+            grads[prefix + "lake_weir_exp"] = reach.grad_lake_weir_exp;
+        } else if (reach.is_lake) {
             grads[prefix + "lake_q_ref"] = reach.grad_lake_q_ref;
             grads[prefix + "lake_exp"] = reach.grad_lake_exp;
             grads[prefix + "lake_q_min"] = reach.grad_lake_q_min;
@@ -903,6 +975,7 @@ inline std::unordered_map<std::string, double> MuskingumCungeRouter::get_gradien
             }
         }
     }
+    add_transfer_gradients(network_, grads);
 
     return grads;
 }
@@ -935,6 +1008,30 @@ inline std::vector<double> MuskingumCungeRouter::get_all_discharges() const {
     return discharges;
 }
 
+inline double MuskingumCungeRouter::get_net_discharge(int reach_id) const {
+    return to_double(network_.get_reach(reach_id).net_outflow());
+}
+
+inline double MuskingumCungeRouter::channel_storage() const {
+    double s = 0.0;
+    for (int reach_id : network_.topological_order()) {
+        const Reach& r = network_.get_reach(reach_id);
+        if (r.is_lake) continue;
+        double K = to_double(r.K), X = to_double(r.X);
+        s += K * (X * to_double(r.inflow_curr) + (1.0 - X) * to_double(r.outflow_curr));
+    }
+    return s;
+}
+
+inline MassBalance MuskingumCungeRouter::mass_balance() const {
+    if (!mass_balance_.initialized()) return MassBalance{};
+    return mass_balance_.report(network_, channel_storage());
+}
+
+inline void MuskingumCungeRouter::reset_mass_balance() {
+    mass_balance_.reset(network_, channel_storage());
+}
+
 inline void MuskingumCungeRouter::reset_state() {
     for (int reach_id : network_.topological_order()) {
         Reach& reach = network_.get_reach(reach_id);
@@ -943,8 +1040,15 @@ inline void MuskingumCungeRouter::reset_state() {
         reach.outflow_prev = Real(0.0);
         reach.outflow_curr = Real(0.0);
         reach.lateral_inflow = Real(0.0);
+        reach.transfer_in = Real(0.0);
+        reach.transfer_out = Real(0.0);
+    }
+    for (auto& t : network_.transfers()) {
+        t.gw_store = Real(0.0);
+        t.last_flow = Real(0.0);
     }
     current_time_ = 0.0;
+    mass_balance_.invalidate();
     reset_gradients();
 }
 
@@ -1034,7 +1138,14 @@ public:
     void set_lateral_inflows(const std::vector<double>& inflows);
     double get_discharge(int reach_id) const;
     std::vector<double> get_all_discharges() const;
+    double get_net_discharge(int reach_id) const;
     void reset_state();
+
+    // =========== Mass balance ===========
+    MassBalance mass_balance() const;
+    void reset_mass_balance();
+    /** Water in transit inside the convolution kernels [m^3] (exact). */
+    double channel_storage() const;
     
     // =========== Time Management ===========
     double current_time() const { return current_time_; }
@@ -1051,6 +1162,13 @@ private:
     double current_time_ = 0.0;
     bool recording_ = false;
     bool initialized_ = false;
+
+    // Transfers / lakes / water balance
+    transfer_ops::MassBalanceTracker mass_balance_;
+    transfer_ops::TransferIndex tindex_;
+    bool use_transfers_ = false;
+    double step_losses_ = 0.0;
+    double step_year_ = 0.0;
     
     // Soft-masked kernel configuration
     int max_kernel_size_;           // Fixed maximum kernel length
@@ -1227,14 +1345,18 @@ inline Real IRFRouter::compute_masked_weight(int reach_id, int i, const Real& tr
 }
 
 inline Real IRFRouter::compute_reach_inflow(const Reach& reach) {
-    Real Q_in = Real(0.0);
+    Real Q_in = use_transfers_ ? Real(reach.transfer_in) : Real(0.0);
     
     if (reach.upstream_junction_id >= 0) {
         try {
             const Junction& junc = network_.get_junction(reach.upstream_junction_id);
             for (int up_id : junc.upstream_reach_ids) {
                 const Reach& up_reach = network_.get_reach(up_id);
-                Q_in = Q_in + up_reach.outflow_curr;
+                if (use_transfers_) {
+                    Q_in = Q_in + up_reach.net_outflow();
+                } else {
+                    Q_in = Q_in + up_reach.outflow_curr;
+                }
             }
         } catch (...) {}
     }
@@ -1245,6 +1367,20 @@ inline Real IRFRouter::compute_reach_inflow(const Reach& reach) {
 inline void IRFRouter::route_reach_irf(Reach& reach) {
     // Get upstream inflow
     Real Q_upstream = compute_reach_inflow(reach);
+
+    // Level-pool lake node: storage routing replaces the convolution
+    if (reach.is_lake && reach.lake_model == LAKE_LEVEL_POOL) {
+        const int nsub = (config_.num_substeps > 1) ? config_.num_substeps : 4;
+        reach.inflow_curr = Q_upstream;
+        reach.outflow_curr = transfer_ops::route_level_pool(
+            network_, reach, Q_upstream + reach.lateral_inflow, config_.dt, nsub,
+            tindex_, step_year_, current_time_, step_losses_);
+        if (use_transfers_) {
+            transfer_ops::apply_outflow_transfers(network_, reach, tindex_, step_year_,
+                                                  current_time_, config_.dt, step_losses_);
+        }
+        return;
+    }
     
     // Total inflow = upstream + lateral
     Real Q_in = Q_upstream + reach.lateral_inflow;
@@ -1359,6 +1495,12 @@ inline void IRFRouter::route_reach_irf(Reach& reach) {
     // Update reach state
     reach.inflow_curr = Q_in;
     reach.outflow_curr = Q_out;
+
+    // Withdraw from this reach's outflow before downstream inflow is summed
+    if (use_transfers_) {
+        transfer_ops::apply_outflow_transfers(network_, reach, tindex_, step_year_,
+                                              current_time_, config_.dt, step_losses_);
+    }
 }
 
 inline void IRFRouter::route_timestep() {
@@ -1367,11 +1509,22 @@ inline void IRFRouter::route_timestep() {
         initialize_kernels();
     }
     
-    // Route each reach in topological order
+    if (!mass_balance_.initialized()) mass_balance_.reset(network_, channel_storage());
+    mass_balance_.add_input(network_, config_.dt);
+
+    use_transfers_ = !network_.transfers().empty();
+    step_losses_ = 0.0;
+    step_year_ = time_to_year(network_.transfer_options(), current_time_);
+    tindex_ = transfer_ops::begin_step(network_, config_.dt, step_losses_);
+
+    // Route each reach in topological order (tree + transfer edges)
     for (int reach_id : network_.topological_order()) {
         Reach& reach = network_.get_reach(reach_id);
         route_reach_irf(reach);
     }
+
+    mass_balance_.add_losses(step_losses_);
+    mass_balance_.add_terminal(network_, config_.dt, /*trapezoid=*/false);
     
     current_time_ += config_.dt;
 }
@@ -1440,7 +1593,12 @@ inline std::unordered_map<std::string, double> IRFRouter::get_gradients() const 
         grads[prefix + "manning_n"] = reach.grad_manning_n;
         grads[prefix + "width_coef"] = reach.grad_width_coef;
         grads[prefix + "depth_coef"] = reach.grad_depth_coef;
+        if (reach.is_lake && reach.lake_model == LAKE_LEVEL_POOL) {
+            grads[prefix + "lake_weir_coef"] = reach.grad_lake_weir_coef;
+            grads[prefix + "lake_weir_exp"] = reach.grad_lake_weir_exp;
+        }
     }
+    add_transfer_gradients(network_, grads);
     
     return grads;
 }
@@ -1490,9 +1648,60 @@ inline void IRFRouter::reset_state() {
     for (auto& [id, history] : inflow_history_) {
         std::fill(history.begin(), history.end(), Real(0.0));
     }
+    for (int reach_id : network_.topological_order()) {
+        Reach& reach = network_.get_reach(reach_id);
+        reach.transfer_in = Real(0.0);
+        reach.transfer_out = Real(0.0);
+    }
+    for (auto& t : network_.transfers()) {
+        t.gw_store = Real(0.0);
+        t.last_flow = Real(0.0);
+    }
     
     current_time_ = 0.0;
+    mass_balance_.invalidate();
     reset_gradients();
+}
+
+inline double IRFRouter::get_net_discharge(int reach_id) const {
+    return to_double(network_.get_reach(reach_id).net_outflow());
+}
+
+inline double IRFRouter::channel_storage() const {
+    // Water still in transit: sum_i Q_in[t-i] * (1 - cumulative kernel weight to i) * dt
+    double total = 0.0;
+    for (const auto& [reach_id, history] : inflow_history_) {
+        const Reach& reach = network_.get_reach(reach_id);
+        if (reach.is_lake && reach.lake_model == LAKE_LEVEL_POOL) continue;
+        double n = to_double(reach.manning_n);
+        double velocity = (1.0 / n) * std::sqrt(reach.slope);
+        velocity = std::max(0.1, std::min(5.0, velocity));
+        double scale = (reach.length / velocity) / shape_param_;
+        std::vector<double> w(max_kernel_size_);
+        double wsum = 0.0;
+        for (int i = 0; i < max_kernel_size_; ++i) {
+            double t = kernel_times_[i];
+            w[i] = std::pow(t, shape_param_ - 1.0) * std::exp(-t / scale);
+            wsum += w[i];
+        }
+        if (wsum <= 1e-10) { std::fill(w.begin(), w.end(), 0.0); w[0] = 1.0; wsum = 1.0; }
+        double cum = 0.0;
+        int nh = static_cast<int>(history.size());
+        for (int i = 0; i < nh && i < max_kernel_size_; ++i) {
+            cum += w[i] / wsum;
+            total += to_double(history[i]) * std::max(0.0, 1.0 - cum) * config_.dt;
+        }
+    }
+    return total;
+}
+
+inline MassBalance IRFRouter::mass_balance() const {
+    if (!mass_balance_.initialized()) return MassBalance{};
+    return mass_balance_.report(network_, channel_storage());
+}
+
+inline void IRFRouter::reset_mass_balance() {
+    mass_balance_.reset(network_, channel_storage());
 }
 
 
@@ -1576,6 +1785,7 @@ private:
 inline DiffusiveWaveRouter::DiffusiveWaveRouter(Network& network, RouterConfig config)
     : network_(network), config_(std::move(config)) {
     network_.build_topology();
+    network_.require_tree_only("DiffusiveWaveRouter");
     nodes_per_reach_ = config_.dw_num_nodes;  // Use config value
     initialize_state();
 }
@@ -2033,6 +2243,7 @@ private:
 inline LagRouter::LagRouter(Network& network, RouterConfig config)
     : network_(network), config_(std::move(config)) {
     network_.build_topology();
+    network_.require_tree_only("LagRouter");
     initialize_lags();
 }
 
@@ -2283,6 +2494,7 @@ private:
 inline KWTRouter::KWTRouter(Network& network, RouterConfig config)
     : network_(network), config_(std::move(config)) {
     network_.build_topology();
+    network_.require_tree_only("KWTRouter");
     reset_state();
 }
 

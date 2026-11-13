@@ -75,6 +75,7 @@ public:
         : network_(network), config_(config)
     {
         network_.build_topology();
+        network_.require_tree_only("EnzymeRouter");
         initialize_arrays();
         initialize_extended_state();
     }

@@ -109,6 +109,38 @@ class DRouteConfig(BaseModel):
     )
     config_file: str = Field(default='droute_config.yaml', alias='DROUTE_CONFIG_FILE')
 
+    # Hydrofabric layers beyond the tree (see docs/transfers_and_lakes.md)
+    transfers_file: str = Field(
+        default='default',
+        alias='DROUTE_TRANSFERS_FILE',
+        description="transfers.csv; 'default' = next to the topology file, 'none' = off"
+    )
+    lakes_file: str = Field(
+        default='default',
+        alias='DROUTE_LAKES_FILE',
+        description="lakes.csv (level-pool nodes); 'default' = next to the topology file, 'none' = off"
+    )
+    enable_groundwater_transfers: bool = Field(
+        default=False,
+        alias='DROUTE_ENABLE_GROUNDWATER_TRANSFERS',
+        description='Apply groundwater transfer edges (hypotheses; off by default)'
+    )
+    transfer_capacity_factor: float = Field(
+        default=1.0,
+        alias='DROUTE_TRANSFER_CAPACITY_FACTOR',
+        description='Default headrace/diversion capacity = factor * prior mean flow at the source'
+    )
+    bifurcation_fraction: float = Field(
+        default=0.25,
+        alias='DROUTE_BIFURCATION_FRACTION',
+        description='Default natural_bifurcation fraction when transfers.csv leaves it empty'
+    )
+    lake_weir_c: float = Field(
+        default=1.7,
+        alias='DROUTE_LAKE_WEIR_C',
+        description='Default weir coefficient C_w [m^0.5/s] of level-pool lake nodes'
+    )
+
     # Integration settings
     from_model: str = Field(
         default='default',

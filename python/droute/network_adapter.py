@@ -127,6 +127,9 @@ class DRouteNetworkAdapter:
             # Optional: load width if available
             if 'width' in ds:
                 topology['widths'] = ds['width'].values.astype(float)
+            # Optional: per-segment Manning's n prior
+            if 'mann_n' in ds:
+                topology['mann_n'] = ds['mann_n'].values.astype(float)
 
         self.logger.info(
             f"Loaded topology: {len(topology['seg_ids'])} segments, "
@@ -150,6 +153,8 @@ class DRouteNetworkAdapter:
 
             if 'width' in ds.variables:
                 topology['widths'] = ds.variables['width'][:].astype(float)
+            if 'mann_n' in ds.variables:
+                topology['mann_n'] = ds.variables['mann_n'][:].astype(float)
 
         return topology
 
@@ -263,6 +268,9 @@ class DRouteNetworkAdapter:
             'hru_to_seg_idx': [id_to_idx.get(sid, -1) for sid in topology['hru_to_seg']],
             'hru_areas': topology['hru_areas'].tolist(),
         }
+
+        if 'mann_n' in topology:
+            droute_config['mann_n'] = np.asarray(topology['mann_n']).tolist()
 
         # Add optional width if available
         if 'widths' in topology:
@@ -444,4 +452,316 @@ class DRouteNetworkAdapter:
         return is_valid, warnings
 
 
-__all__ = ['DRouteNetworkAdapter']
+    # =========================================================================
+    # Hydrofabric extensions: transfers.csv and lakes.csv (non-tree layers)
+    # =========================================================================
+
+    def build_network(self, droute_config: Dict[str, Any], mannings_n: Optional[float] = None):
+        """Build a dRoute C++ Network from :meth:`to_droute_format` output.
+
+        Reach ids are segment indices (0..n-1); junction i collects the reaches
+        draining into reach i, and terminal reaches drain into junction n.
+        Uses the per-segment ``mann_n`` prior when present unless ``mannings_n``
+        is given.
+        """
+        import droute
+
+        n = droute_config['n_segments']
+        downstream_idx = droute_config['downstream_idx']
+        lengths = droute_config['lengths']
+        slopes = droute_config['slopes']
+        widths = droute_config.get('widths')
+        mann = droute_config.get('mann_n')
+
+        net = droute.Network()
+        upstream: Dict[int, List[int]] = {i: [] for i in range(n + 1)}
+        for i in range(n):
+            ds_idx = downstream_idx[i]
+            upstream[ds_idx if ds_idx >= 0 else n].append(i)
+        for jid in range(n + 1):
+            junc = droute.Junction()
+            junc.id = jid
+            junc.upstream_reach_ids = upstream[jid]
+            net.add_junction(junc)
+        for i in range(n):
+            reach = droute.Reach()
+            reach.id = i
+            reach.length = float(lengths[i])
+            reach.slope = max(float(slopes[i]), 1e-4)
+            if mannings_n is not None:
+                reach.manning_n = float(mannings_n)
+            elif mann is not None:
+                reach.manning_n = float(mann[i])
+            reach.upstream_junction_id = i
+            ds_idx = downstream_idx[i]
+            reach.downstream_junction_id = ds_idx if ds_idx >= 0 else n
+            if widths is not None:
+                geom = reach.geometry
+                geom.width_coef = float(widths[i])
+                geom.width_exp = 0.0
+                reach.geometry = geom
+            net.add_reach(reach)
+        net.build_topology()
+        return net
+
+    @staticmethod
+    def upstream_areas_km2(droute_config: Dict[str, Any]) -> np.ndarray:
+        """Tree-only upstream drainage area of each segment [km^2]."""
+        n = droute_config['n_segments']
+        local = np.zeros(n)
+        for hru_idx, seg_idx in enumerate(droute_config['hru_to_seg_idx']):
+            if seg_idx >= 0:
+                local[seg_idx] += droute_config['hru_areas'][hru_idx] / 1e6
+        acc = local.copy()
+        for i in droute_config['routing_order']:
+            d = droute_config['downstream_idx'][i]
+            if d >= 0:
+                acc[d] += acc[i]
+        return acc
+
+    def load_transfers(self, path: Path) -> List[Dict[str, Any]]:
+        """Read a transfers table (Landslikan ``droute/transfers.csv``).
+
+        Required columns: transfer_id, type, operated, from_unit, to_unit,
+        capacity_m3s, fraction, rule, commissioned. Optional: decommissioned,
+        status, topology_effect, confidence. Rows whose ``status`` is not
+        ``resolved`` or that lack endpoints are skipped with a warning.
+        """
+        import csv
+
+        required = {'transfer_id', 'type', 'operated', 'from_unit', 'to_unit',
+                    'capacity_m3s', 'fraction', 'rule', 'commissioned'}
+        records = []
+        with open(path, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            missing = required - set(reader.fieldnames or [])
+            if missing:
+                raise ValueError(f"{path}: missing transfer columns {sorted(missing)}")
+            if 'decommissioned' not in (reader.fieldnames or []):
+                self.logger.info(f"{path}: no 'decommissioned' column; edges stay active once commissioned")
+            for row in reader:
+                tid = row['transfer_id']
+                status = (row.get('status') or 'resolved').strip()
+                if status != 'resolved':
+                    self.logger.warning(f"transfer {tid}: status '{status}', skipped ({row.get('reason', '')})")
+                    continue
+                from_unit = _num(row.get('from_unit'))
+                to_unit = _num(row.get('to_unit'))
+                if from_unit is None or to_unit is None:
+                    self.logger.warning(f"transfer {tid}: unresolved endpoint, skipped")
+                    continue
+                records.append({
+                    'transfer_id': tid,
+                    'type': row['type'].strip(),
+                    'operated': str(row.get('operated', '')).strip().lower() in ('true', '1', 'yes'),
+                    'from_unit': int(from_unit),
+                    'to_unit': int(to_unit),
+                    'capacity_m3s': _num(row.get('capacity_m3s')),
+                    'fraction': _num(row.get('fraction')),
+                    'rule': (row.get('rule') or '').strip(),
+                    'commissioned': _num(row.get('commissioned')),
+                    'decommissioned': _num(row.get('decommissioned')),
+                    'topology_effect': (row.get('topology_effect') or '').strip(),
+                    'confidence': (row.get('confidence') or '').strip(),
+                })
+        return records
+
+    def apply_transfers(
+        self,
+        net,
+        transfers: List[Dict[str, Any]],
+        droute_config: Dict[str, Any],
+        storage_withdrawals: Optional[Dict[str, int]] = None,
+        defaults: Optional[Dict[str, float]] = None,
+    ) -> List[str]:
+        """Add transfer edges to a built Network (reach id = segment index).
+
+        Empty ``fraction`` / ``capacity_m3s`` get the defaults in
+        :data:`TRANSFER_DEFAULTS` (calibration parameters). Operated edges listed
+        in a lake's ``operated_withdrawals`` (``storage_withdrawals``) withdraw
+        from that lake's storage. Rebuilds the topology, which raises if the
+        combined graph has a cycle.
+        """
+        import droute
+
+        d = dict(TRANSFER_DEFAULTS)
+        d.update(defaults or {})
+        storage_withdrawals = storage_withdrawals or {}
+        id_to_idx = {int(s): i for i, s in enumerate(droute_config['segment_ids'])}
+        added = []
+        needs_capacity = []
+        for rec in transfers:
+            tid = rec['transfer_id']
+            if rec['from_unit'] not in id_to_idx:
+                self.logger.warning(f"transfer {tid}: from_unit {rec['from_unit']} not in topology, skipped")
+                continue
+            to_unit = rec['to_unit']
+            if to_unit != 0 and to_unit not in id_to_idx:
+                self.logger.warning(f"transfer {tid}: to_unit {to_unit} not in topology, skipped")
+                continue
+            t = droute.Transfer()
+            t.id = tid
+            t.type = droute.parse_transfer_type(rec['type'])
+            t.operated = bool(rec['operated'])
+            t.from_reach = id_to_idx[rec['from_unit']]
+            t.to_reach = id_to_idx[to_unit] if to_unit != 0 else -1
+            kind = rec['type']
+            if rec['fraction'] is not None:
+                t.fraction = float(rec['fraction'])
+            elif kind in ('headrace', 'diversion'):
+                t.fraction = d['operated_fraction']
+            elif kind == 'groundwater':
+                t.fraction = d['groundwater_fraction']
+            else:
+                t.fraction = d['bifurcation_fraction']
+            if kind in ('headrace', 'diversion'):
+                if rec['capacity_m3s'] is not None:
+                    t.capacity = float(rec['capacity_m3s'])
+                elif d['capacity_factor'] is not None and d['capacity_factor'] > 0:
+                    needs_capacity.append(tid)
+            if kind == 'groundwater':
+                t.gw_k = d['groundwater_k_days'] * 86400.0
+            if rec['commissioned'] is not None:
+                t.commissioned = float(rec['commissioned'])
+            if rec.get('decommissioned') is not None:
+                t.decommissioned = float(rec['decommissioned'])
+            if t.operated and tid in storage_withdrawals:
+                if storage_withdrawals[tid] == t.from_reach:
+                    t.from_storage = True
+                else:
+                    self.logger.warning(
+                        f"transfer {tid}: listed as withdrawal of a lake at reach "
+                        f"{storage_withdrawals[tid]} but from_unit is reach {t.from_reach}")
+            if rec['rule']:
+                self.logger.warning(
+                    f"transfer {tid}: rule '{rec['rule']}' is not interpreted; register a callable "
+                    "with net.get_transfer(id).rule = f(year, time_s, q_available)")
+            net.add_transfer(t)
+            added.append(tid)
+        net.build_topology()   # raises RuntimeError on a cycle
+        if needs_capacity:
+            # Capacity prior: factor * mean-flow prior at the source, using the
+            # effective drainage area of the combined graph (upstream diversions
+            # feed the source, e.g. Thorisvatn receives Kvislaveita).
+            area = self.effective_areas_km2(net, droute_config)
+            for tid in needs_capacity:
+                t = net.get_transfer(tid)
+                q_prior = area[t.from_reach] * d['specific_runoff_m3s_km2']
+                t.capacity = float(d['capacity_factor'] * q_prior)
+        self.logger.info(f"Applied {len(added)} transfer edges")
+        return added
+
+    def effective_areas_km2(self, net, droute_config: Dict[str, Any]) -> np.ndarray:
+        """Drainage area of each segment on the combined tree + transfer graph.
+
+        Transfers move ``fraction`` of the area-weighted flow (capacities and
+        commissioning dates are ignored; groundwater edges are skipped).
+        """
+        import droute
+
+        n = droute_config['n_segments']
+        acc = np.zeros(n)
+        for hru_idx, seg_idx in enumerate(droute_config['hru_to_seg_idx']):
+            if seg_idx >= 0:
+                acc[seg_idx] += droute_config['hru_areas'][hru_idx] / 1e6
+        by_from: Dict[int, List[Any]] = {}
+        for tid in net.transfer_ids():
+            t = net.get_transfer(tid)
+            if t.enabled and t.type != droute.TransferType.groundwater:
+                by_from.setdefault(t.from_reach, []).append(t)
+        for i in net.topological_order():
+            out = acc[i]
+            rem = out
+            for t in by_from.get(i, []):
+                moved = min(max(t.fraction, 0.0) * out, rem)
+                rem -= moved
+                if t.to_reach >= 0:
+                    acc[t.to_reach] += moved
+            dsi = droute_config['downstream_idx'][i]
+            if dsi >= 0:
+                acc[dsi] += rem
+        return acc
+
+    def apply_hydrofabric(
+        self,
+        net,
+        droute_config: Dict[str, Any],
+        transfers_path: Optional[Path] = None,
+        lakes_path: Optional[Path] = None,
+        enable_groundwater: bool = False,
+        sim_start_year: Optional[float] = None,
+        transfer_defaults: Optional[Dict[str, float]] = None,
+        lake_params: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        """Apply lakes.csv (level-pool nodes) and transfers.csv to a built Network."""
+        from .lake_preprocessor import apply_level_pool_lakes, load_lakes_table
+
+        summary: Dict[str, Any] = {'lakes': 0, 'transfers': []}
+        storage_withdrawals: Dict[str, int] = {}
+        id_to_idx = {int(s): i for i, s in enumerate(droute_config['segment_ids'])}
+        if lakes_path is not None and Path(lakes_path).exists():
+            lakes = load_lakes_table(Path(lakes_path), logger=self.logger)
+            storage_withdrawals = apply_level_pool_lakes(
+                net, lakes, id_to_idx, widths=droute_config.get('widths'),
+                params=lake_params, logger=self.logger)
+            summary['lakes'] = sum(1 for u in lakes if int(u) in id_to_idx)
+        if transfers_path is not None and Path(transfers_path).exists():
+            records = self.load_transfers(Path(transfers_path))
+            summary['transfers'] = self.apply_transfers(
+                net, records, droute_config, storage_withdrawals, transfer_defaults)
+        opts = net.transfer_options
+        opts.enable_groundwater = bool(enable_groundwater)
+        if sim_start_year is not None:
+            opts.sim_start_year = float(sim_start_year)
+        return summary
+
+    def load_hydrofabric(
+        self,
+        directory: Path,
+        mannings_n: Optional[float] = None,
+        **kwargs: Any,
+    ):
+        """Load topology.nc, transfers.csv and lakes.csv from one directory.
+
+        Returns ``(network, droute_config, summary)``. Extra keyword arguments go
+        to :meth:`apply_hydrofabric` (enable_groundwater, sim_start_year, ...).
+        """
+        directory = Path(directory)
+        topology = self.load_topology(directory / 'topology.nc')
+        droute_config = self.to_droute_format(topology)
+        net = self.build_network(droute_config, mannings_n=mannings_n)
+        summary = self.apply_hydrofabric(
+            net, droute_config,
+            transfers_path=directory / 'transfers.csv',
+            lakes_path=directory / 'lakes.csv',
+            **kwargs)
+        return net, droute_config, summary
+
+
+#: Starting values for transfer parameters left empty in transfers.csv. They are
+#: calibration parameters (fraction, capacity, gw_k are on the AD tape).
+TRANSFER_DEFAULTS: Dict[str, float] = {
+    'operated_fraction': 1.0,          # headrace/diversion: take up to capacity
+    'capacity_factor': 1.0,            # capacity = factor * prior mean flow at from_unit
+    'specific_runoff_m3s_km2': 0.05,   # prior mean flow = upstream area * 50 L/s/km2
+    'bifurcation_fraction': 0.25,      # natural_bifurcation share
+    'groundwater_fraction': 0.05,      # groundwater leak share
+    'groundwater_k_days': 30.0,        # groundwater store residence time
+}
+
+
+def _num(v: Any) -> Optional[float]:
+    """Parse a CSV number; empty / NaN -> None."""
+    if v is None:
+        return None
+    v = str(v).strip()
+    if not v:
+        return None
+    try:
+        f = float(v)
+    except ValueError:
+        return None
+    return None if f != f else f
+
+
+__all__ = ['DRouteNetworkAdapter', 'TRANSFER_DEFAULTS']
