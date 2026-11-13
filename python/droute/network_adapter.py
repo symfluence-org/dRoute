@@ -130,6 +130,9 @@ class DRouteNetworkAdapter:
             # Optional: per-segment Manning's n prior
             if 'mann_n' in ds:
                 topology['mann_n'] = ds['mann_n'].values.astype(float)
+            # Optional (Landslikan >= v0.4): 0 drains on, 1 sea, 2 closed-basin sink
+            if 'terminal_type' in ds:
+                topology['terminal_type'] = ds['terminal_type'].values.astype(int)
 
         self.logger.info(
             f"Loaded topology: {len(topology['seg_ids'])} segments, "
@@ -155,6 +158,8 @@ class DRouteNetworkAdapter:
                 topology['widths'] = ds.variables['width'][:].astype(float)
             if 'mann_n' in ds.variables:
                 topology['mann_n'] = ds.variables['mann_n'][:].astype(float)
+            if 'terminal_type' in ds.variables:
+                topology['terminal_type'] = ds.variables['terminal_type'][:].astype(int)
 
         return topology
 
@@ -271,6 +276,18 @@ class DRouteNetworkAdapter:
 
         if 'mann_n' in topology:
             droute_config['mann_n'] = np.asarray(topology['mann_n']).tolist()
+
+        if 'terminal_type' in topology:
+            # Informational: every reach without a downstream segment is a
+            # terminal in dRoute (its outflow is reported as terminal_outflow),
+            # whether it reaches the sea (1) or a closed-basin sink (2).
+            tt = np.asarray(topology['terminal_type']).astype(int)
+            droute_config['terminal_type'] = tt.tolist()
+            bad = int(np.sum((tt != 0) != outlet_mask))
+            if bad:
+                self.logger.warning(
+                    f"terminal_type disagrees with downSegId for {bad} segments "
+                    "(terminal_type 0 must have a downstream segment, 1/2 must not)")
 
         # Add optional width if available
         if 'widths' in topology:
