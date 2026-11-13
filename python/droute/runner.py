@@ -153,22 +153,29 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         routing_method = self.droute_routing_method
         routing_dt = self.droute_routing_dt
 
+        # Transfers / level-pool lakes exist only in the C++ routers: the numpy
+        # fallback routes the bare tree, so it must not stand in silently.
+        layers = [p for p in (
+            self._resolve_layer_file(self.droute_transfers_file, 'transfers.csv'),
+            self._resolve_layer_file(self.droute_lakes_file, 'lakes.csv'),
+        ) if p is not None]
+
         # Execute routing (C++ bindings with numpy fallback)
         routed_flow = None
+        if layers and not HAS_DROUTE:
+            raise ModelExecutionError(
+                f"dRoute C++ bindings are required to route with {[str(p) for p in layers]}; "
+                "set DROUTE_TRANSFERS_FILE / DROUTE_LAKES_FILE to 'none' to route the tree only")
         if HAS_DROUTE:
             try:
                 routed_flow = self._route_with_droute(
                     runoff_data, network_config, routing_method, routing_dt,
                     time_index=time_index,
                 )
-            except RuntimeError as e:
-                # Invalid transfer graph (cycle) must not silently fall back
-                if 'cycle' in str(e):
-                    raise ModelExecutionError(str(e)) from e
-                self.logger.warning(
-                    f"dRoute C++ bindings failed ({e}), falling back to numpy routing."
-                )
             except Exception as e:  # noqa: BLE001
+                if layers:
+                    raise ModelExecutionError(
+                        f"dRoute routing with transfers/lakes failed: {type(e).__name__}: {e}") from e
                 self.logger.warning(
                     f"dRoute C++ bindings failed ({e}), falling back to numpy routing."
                 )
@@ -474,7 +481,6 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
             net.add_reach(reach)
 
         net.build_topology()
-        topo_order = net.topological_order()
         self.logger.info(f"dRoute C++ network built: {net.num_reaches()} reaches, {net.num_junctions()} junctions")
 
         # Apply lake/reservoir config (settings/dRoute/droute_lakes.yaml) onto the
@@ -491,6 +497,9 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         config.enable_gradients = False
 
         router = droute.MuskingumCungeRouter(net, config)
+        # Taken after transfers are added: they change the topological order of
+        # the combined graph, and get_all_discharges() follows that order.
+        topo_order = net.topological_order()
 
         # Route timestep-by-timestep.
         # NOTE: get_all_discharges() returns values ordered by the network's
@@ -557,8 +566,8 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         if transfers_path is None and lakes_path is None:
             return {}
         if not network.get('segment_ids'):
-            self.logger.warning("Network has no segment ids; transfers/lakes not applied")
-            return {}
+            raise ModelExecutionError(
+                "Network has no segment ids, so transfers.csv / lakes.csv cannot be matched to it")
         sim_start_year = None
         if time_index is not None and len(time_index) > 0:
             t0 = time_index[0]
