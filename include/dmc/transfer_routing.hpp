@@ -145,6 +145,19 @@ inline double rule_cap(const Transfer& t, double year, double time_s, double q_a
     return r < 0.0 ? 0.0 : r;
 }
 
+/**
+ * Demand of a reservoir (storage) withdrawal: fraction of the capacity, i.e.
+ * min(Q_available, capacity, rule) with fraction = 1. Falls back to
+ * fraction * inflow when no capacity is set.
+ */
+inline Real storage_demand(const Transfer& t, const Real& inflow, double cap) {
+    Real demand = t.has_capacity ? Real(t.fraction * t.capacity) : Real(t.fraction * inflow);
+    if (!std::isnan(cap)) {
+        demand = safe_min(demand, Real(cap));
+    }
+    return demand;
+}
+
 /** Demand of one edge given its reference flow (before availability limits). */
 inline Real edge_demand(const Transfer& t, const Real& q_ref, double cap) {
     Real demand = t.fraction * q_ref;
@@ -169,9 +182,12 @@ inline bool is_storage_withdrawal(const Transfer& t, const Reach& from) {
  *
  *   dS/dt = I - spill(S) - sum_i W_i
  *   spill  = weir_coef * h^weir_exp,  h = max(S, 0) / A   (S relative to the crest)
- *   W_i    = min(fraction_i * I, capacity_i, rule_i(t), available)
+ *   W_i    = min(fraction_i * capacity_i, rule_i(t), available)
  *            for operated edges flagged from_storage (reservoir withdrawals),
- *            drawing the lake down to lake_min_storage at most.
+ *            drawing the lake down to lake_min_storage at most. Without a
+ *            capacity the demand is fraction_i * I. The demand is not tied to
+ *            the current inflow, so a reservoir keeps delivering from storage
+ *            when inflow drops (that is what the drawdown range is for).
  *
  * The spill uses a linearised implicit update (stable for any dt, since the
  * weir curve is convex) and the storage update is exact in volume, so the
@@ -214,7 +230,7 @@ inline Real route_level_pool(Network& net, Reach& reach, const Real& inflow_tota
         Real W_tot = Real(0.0);
         for (size_t e = 0; e < edges.size(); ++e) {
             const Transfer& t = net.transfers()[edges[e]];
-            Real demand = edge_demand(t, I, caps[e]);
+            Real demand = storage_demand(t, I, caps[e]);
             Real w = safe_max(safe_min(demand, Real(avail - W_tot)), Real(0.0));
             W_tot = W_tot + w;
             w_sum[e] = w_sum[e] + w;
