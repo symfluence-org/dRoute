@@ -162,22 +162,6 @@ if(NOT EXISTS "${BMI_INCLUDE_DIR}/bmi.hxx")
     endif()
 endif()
 
-# yaml-cpp for configuration - prefer system install
-find_package(yaml-cpp QUIET)
-if(NOT yaml-cpp_FOUND)
-    message(STATUS "yaml-cpp not found, will download (this may take a minute)...")
-    FetchContent_Declare(
-        yaml-cpp
-        GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
-        GIT_TAG yaml-cpp-0.7.0
-        GIT_SHALLOW TRUE
-    )
-    set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-    set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(yaml-cpp)
-endif()
-
 # NetCDF for reading model outputs
 if(DMC_ENABLE_NETCDF)
     # Try to find system netCDF-cxx4

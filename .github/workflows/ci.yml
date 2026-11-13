@@ -34,7 +34,7 @@ jobs:
       - name: System deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libnetcdf-dev libyaml-cpp-dev   # system yaml-cpp: the fetched 0.7.0 does not compile with GCC 13
+          sudo apt-get install -y cmake ninja-build libnetcdf-dev
 
       - name: C++ build (CoDiPack, NetCDF, tests)
         run: |
