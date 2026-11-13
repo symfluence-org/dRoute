@@ -87,8 +87,11 @@ Each source reach applies its edges in file order. Every edge takes
 * **Reservoir withdrawals:** an operated edge whose id is listed in the source lake's
   `operated_withdrawals` gets `from_storage = True` and draws from the lake's
   **storage** rather than from its spill. Its demand is
-  `min(fraction·I_lake, capacity, rule)`, limited by the available water, and it can
-  lower the lake to `lake_min_storage` below the crest.
+  `min(fraction·capacity, rule)` (`fraction·I_lake` if no capacity is set), limited by
+  the water available above `lake_min_storage`. The demand does not follow the
+  inflow, so the reservoir keeps delivering from storage when inflow drops and is
+  drawn down below the crest, at most to `lake_min_storage`. With `fraction = 1` this
+  is the contract's `min(Q_available, capacity, rule(t))`.
 
 ### Defaults for empty fields (calibration parameters)
 
@@ -175,4 +178,28 @@ are skipped. Units are matched to `segId` in topology.nc.
 
 `lakes.csv`: `unit_id` (the outlet segment) and `area_km2` are required. `reservoir`,
 `operated_withdrawals` (comma-separated transfer ids), `max_depth_m_wfd` and
-`storage_curve` are optional.
+`storage_curve` are optional. `crest_elev_m`, `shares_outlet_with` and
+`terminal_type` are accepted and not needed: storage is measured from the crest, and
+lakes are merged by their shared `unit_id`.
+
+`topology.nc`: the optional `terminal_type` variable (0 drains on, 1 sea, 2 sink) is
+read and checked against `downSegId`. dRoute treats every reach without a downstream
+segment as a terminal, so sea outlets and sinks both count as `terminal_outflow`.
+
+Missing optional columns fall back to the defaults above, so tables from older
+hydrofabric builds (without `decommissioned`, `crest_elev_m`, `terminal_type`, ...)
+load unchanged.
+
+## Validation
+
+`build_topology()` (and so every router constructor and the loaders) raises
+`ValueError` when a transfer `fraction` is outside [0, 1], or when the
+`natural_bifurcation` and `groundwater` fractions leaving one reach add up to more
+than 1 (for example SKA-1 + SKA-2 from the same Skaftá unit). Operated edges are not
+part of this sum: they are capped by capacity and by what is left of the flow. At run
+time every withdrawal is also limited to the flow left at the source, so the source
+never goes negative even if a calibrated fraction leaves the valid range between
+rebuilds.
+
+The SYMFLUENCE runner does not fall back to the numpy (tree-only) router when
+transfers or lakes are configured: a failure is raised as `ModelExecutionError`.

@@ -215,10 +215,8 @@ class TestLevelPoolLakes:
         A = 1e6
         make_lake(net, 0, area=A, weir_coef=15.0, reservoir=True, min_storage=-A * 2.0)
         t = transfer('H1', 'headrace', 0, 2, fraction=1.0, capacity=5.0, from_storage=True)
-        t.rule = lambda year, time_s, q: 5.0      # operate at 5 m3/s regardless of inflow
         net.add_transfer(t)
-        # demand = min(fraction*I, capacity, rule) = 1 with I = 1; drop fraction to test the floor
-        net.get_transfer('H1').fraction = 5.0      # demand = min(5*I, 5) = 5 > inflow
+        # demand = min(fraction*capacity, rule) = 5 m3/s > inflow of 1 m3/s: storage is drawn down
         run(net, {0: 1.0}, 24 * 20)
         lake = net.get_reach(0)
         assert lake.storage == pytest.approx(-A * 2.0, rel=1e-6)   # hits the drawdown floor
@@ -249,6 +247,18 @@ class TestOrdering:
         assert 'BACK' in str(exc.value)
         with pytest.raises(RuntimeError, match='cycle'):
             droute.MuskingumCungeRouter(net, droute.RouterConfig())
+
+    def test_fractions_validated(self):
+        net, _ = make_net([1, 2, -1, -1, -1])
+        net.add_transfer(transfer('SKA-1', 'natural_bifurcation', 0, 3, fraction=0.6, operated=False))
+        net.add_transfer(transfer('SKA-2', 'natural_bifurcation', 0, 4, fraction=0.5, operated=False))
+        with pytest.raises(ValueError, match='SKA-1 \\+ SKA-2'):
+            net.build_topology()
+        net.get_transfer('SKA-2').fraction = 0.4
+        net.build_topology()
+        net.get_transfer('SKA-2').fraction = 1.5
+        with pytest.raises(ValueError, match='outside'):
+            net.build_topology()
 
     def test_invalid_endpoints(self):
         net, _ = make_net([1, -1])
@@ -402,6 +412,35 @@ def test_mc_gradients_match_finite_differences(name, setter, value):
     assert ad == pytest.approx(fd, rel=2e-3, abs=1e-6), f"{name}: AD={ad} FD={fd}"
 
 
+def _grad_net_storage():
+    # reservoir at 2 with a storage withdrawal 2 => 5, groundwater 1 ~> 6
+    net, _ = make_net([1, 2, 3, -1, 5, 6, -1])
+    make_lake(net, 2, area=5e5, weir_coef=25.0, reservoir=True, min_storage=-5e5 * 2)
+    net.get_reach(2).storage = 2e5
+    net.add_transfer(transfer('RES', 'headrace', 2, 5, fraction=0.8, capacity=4.0, from_storage=True))
+    net.add_transfer(transfer('GW', 'groundwater', 1, 6, fraction=0.1, operated=False, gw_k=2 * 86400.0))
+    net.transfer_options.enable_groundwater = True
+    return net
+
+
+@pytest.mark.parametrize('name,setter,value,outlet', [
+    ('transfer_RES_fraction', lambda n, v: setattr(n.get_transfer('RES'), 'fraction', v), 0.8, 6),
+    ('transfer_RES_capacity', lambda n, v: setattr(n.get_transfer('RES'), 'capacity', v), 4.0, 6),
+    ('transfer_GW_fraction', lambda n, v: setattr(n.get_transfer('GW'), 'fraction', v), 0.1, 6),
+    ('transfer_GW_gw_k', lambda n, v: setattr(n.get_transfer('GW'), 'gw_k', v), 2 * 86400.0, 6),
+])
+def test_mc_storage_and_groundwater_gradients(name, setter, value, outlet):
+    grads, net = _ad_grads(_grad_net_storage, outlet=outlet)
+    if name not in grads:
+        pytest.skip('dRoute built without AD')
+    h = 1e-4 * max(abs(value), 1.0)
+    fd = (_outlet_sum(_grad_net_storage, setter, value + h, outlet=outlet)
+          - _outlet_sum(_grad_net_storage, setter, value - h, outlet=outlet)) / (2 * h)
+    ad = grads[name]
+    assert abs(fd) > 1e-9, f"{name}: parameter has no effect (fd={fd})"
+    assert ad == pytest.approx(fd, rel=2e-3, abs=1e-9), f"{name}: AD={ad} FD={fd}"
+
+
 def test_bifurcation_fraction_gradient():
     # BF moves water from reach 3 (gauge above the split, gross flow unaffected)
     # to reach 6: the gradient is zero at 3 and positive at 6.
@@ -532,3 +571,46 @@ def test_landslikan_v03_conservation(router_name):
         assert abs(win.relative_residual) < 1e-3
     # water moved through transfers during the window
     assert sum(net.get_transfer(t).last_flow for t in net.transfer_ids()) > 0
+
+
+# ---------------------------------------------------------------------------
+# SYMFLUENCE runner: output columns follow segment index with transfers
+# ---------------------------------------------------------------------------
+
+def test_runner_output_columns_with_transfers(tmp_path):
+    """A transfer changes the topological order; routed columns must still be
+    indexed by segment (regression: the runner scattered with the tree order)."""
+    import logging
+    import types
+    runner_mod = pytest.importorskip('droute.runner')
+
+    # segIds 1..6. Transfer 6 -> 1 (from the last segment to the first headwater)
+    # forces segment 1 behind segment 6 in the combined order.
+    downstream = [1, 2, -1, 4, 5, -1]
+    n = len(downstream)
+    network = {
+        'n_segments': n, 'segment_ids': list(range(1, n + 1)), 'downstream_idx': downstream,
+        'lengths': [2000.0] * n, 'slopes': [0.002] * n, 'widths': [10.0] * n,
+        'hru_to_seg_idx': list(range(n)), 'hru_areas': [1.0] * n,
+    }
+    (tmp_path / 'transfers.csv').write_text(
+        'transfer_id,type,operated,from_unit,to_unit,capacity_m3s,fraction,rule,commissioned\n'
+        'X,diversion,True,6,1,,0.5,,\n', encoding='utf-8')
+    stub = types.SimpleNamespace(
+        logger=logging.getLogger('test'), config=None,
+        network_adapter=DRouteNetworkAdapter(),
+        droute_transfers_file=str(tmp_path / 'transfers.csv'), droute_lakes_file='none',
+        droute_enable_groundwater_transfers=False, droute_transfer_capacity_factor=0.0,
+        droute_bifurcation_fraction=0.25, droute_lake_weir_c=1.7,
+        _get_config_value=lambda f, default=None: default,
+        _apply_lakes=lambda net, network: 0,
+    )
+    R = runner_mod.DRouteRunner
+    stub._resolve_layer_file = types.MethodType(R._resolve_layer_file, stub)
+    stub._apply_hydrofabric = types.MethodType(R._apply_hydrofabric, stub)
+    runoff = np.tile(np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), (200, 1))   # m3/s per HRU (area 1)
+    q = R._route_with_droute(stub, runoff, network, 'muskingum_cunge', 3600)
+    # steady state: segment 6 (index 5) = 4+5+6 = 15 gross, half goes to segment 1
+    assert q[-1, 5] == pytest.approx(15.0, rel=1e-3)
+    assert q[-1, 0] == pytest.approx(1.0 + 7.5, rel=1e-3)
+    assert q[-1, 2] == pytest.approx(1.0 + 7.5 + 2.0 + 3.0, rel=1e-3)
