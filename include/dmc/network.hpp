@@ -235,6 +235,13 @@ public:
     // Throw a clear error from routers that do not support the extensions.
     void require_tree_only(const std::string& router_name) const;
 
+    // Check transfer parameters: every fraction in [0, 1], and the passive
+    // shares (natural_bifurcation + groundwater) leaving one reach sum to <= 1
+    // (e.g. Skafta SKA-1 + SKA-2). Throws std::invalid_argument. Called by
+    // build_topology(); at run time withdrawals are additionally capped by the
+    // flow left at the source, so an over-allocated source can never go negative.
+    void validate_transfers() const;
+
     bool has_reach(int id) const { return reaches_.count(id) > 0; }
 
     // Parameter access for AD
@@ -398,7 +405,32 @@ inline void Network::zero_gradients() {
 }
 
 inline void Network::build_topology() {
+    validate_transfers();
     compute_topological_order();
+}
+
+inline void Network::validate_transfers() const {
+    std::unordered_map<int, double> passive_share;
+    std::unordered_map<int, std::string> passive_ids;
+    for (const auto& t : transfers_) {
+        if (!t.enabled) continue;
+        const double f = to_double(t.fraction);
+        if (!(f >= 0.0 && f <= 1.0)) {
+            throw std::invalid_argument("Transfer '" + t.id + "': fraction " + std::to_string(f) +
+                                        " is outside [0, 1]");
+        }
+        if (t.type == TransferType::NaturalBifurcation || t.type == TransferType::Groundwater) {
+            passive_share[t.from_reach] += f;
+            passive_ids[t.from_reach] += (passive_ids[t.from_reach].empty() ? "" : " + ") + t.id;
+        }
+    }
+    for (const auto& [reach_id, share] : passive_share) {
+        if (share > 1.0 + 1e-12) {
+            throw std::invalid_argument("Transfers " + passive_ids[reach_id] + " leaving reach " +
+                                        std::to_string(reach_id) + " take fractions summing to " +
+                                        std::to_string(share) + " > 1");
+        }
+    }
 }
 
 inline void Network::compute_topological_order() {
