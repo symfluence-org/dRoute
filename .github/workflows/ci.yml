@@ -1,0 +1,62 @@
+name: CI
+
+# Fast test gate for pull requests and pushes to main.
+# CoDiPack AD only (no Enzyme/SUNDIALS): the full-flag matrix stays in build-wheels.yml.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libnetcdf-dev libyaml-cpp-dev   # system yaml-cpp: the fetched 0.7.0 does not compile with GCC 13
+
+      - name: C++ build (CoDiPack, NetCDF, tests)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDMC_ENABLE_AD=ON \
+            -DDMC_ENABLE_ENZYME=OFF \
+            -DDMC_ENABLE_NETCDF=ON \
+            -DDMC_BUILD_TESTS=ON \
+            -DDMC_BUILD_PYTHON=OFF
+          cmake --build build
+
+      - name: C++ tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Python package
+        run: |
+          python -m pip install --upgrade pip wheel setuptools
+          CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DDMC_ENABLE_ENZYME=OFF" \
+            python -m pip install ".[dev,symfluence]" xarray netCDF4 pandas
+          python -c "import droute; print('droute', droute.__version__)"
+
+      - name: Python tests (not slow)
+        run: python -m pytest -m "not slow" -q
