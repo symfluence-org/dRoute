@@ -434,7 +434,12 @@ if(DMC_BUILD_TESTS)
     add_executable(test_comprehensive tests/test_comprehensive.cpp)
     target_link_libraries(test_comprehensive PRIVATE dmc_route)
     add_test(NAME comprehensive_suite COMMAND test_comprehensive)
-    
+
+    # Transfers, level-pool lakes, cycle rejection and mass conservation
+    add_executable(test_transfers tests/test_transfers.cpp)
+    target_link_libraries(test_transfers PRIVATE dmc_route)
+    add_test(NAME transfers_and_lakes COMMAND test_transfers)
+
     # AD Backend Comparison test (CoDiPack vs Enzyme)
     add_executable(test_ad_backend_comparison tests/test_ad_backend_comparison.cpp)
     target_link_libraries(test_ad_backend_comparison PRIVATE dmc_route)

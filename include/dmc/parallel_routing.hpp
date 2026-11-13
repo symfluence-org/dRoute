@@ -228,6 +228,7 @@ public:
         , num_threads_(num_threads)
     {
         network_.build_topology();
+        network_.require_tree_only("ParallelEnzymeRouter");
         initialize_arrays();
         
 #ifdef _OPENMP

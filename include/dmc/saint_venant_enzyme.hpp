@@ -367,6 +367,7 @@ inline SaintVenantEnzyme::SaintVenantEnzyme(Network& network, SaintVenantEnzymeC
     : network_(network), config_(std::move(config)) {
     
     network_.build_topology();
+    network_.require_tree_only("SaintVenantEnzyme");
     
     n_reaches_ = network_.topological_order().size();
     n_nodes_ = config_.n_nodes;

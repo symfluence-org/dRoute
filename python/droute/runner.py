@@ -153,14 +153,29 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         routing_method = self.droute_routing_method
         routing_dt = self.droute_routing_dt
 
+        # Transfers / level-pool lakes exist only in the C++ routers: the numpy
+        # fallback routes the bare tree, so it must not stand in silently.
+        layers = [p for p in (
+            self._resolve_layer_file(self.droute_transfers_file, 'transfers.csv'),
+            self._resolve_layer_file(self.droute_lakes_file, 'lakes.csv'),
+        ) if p is not None]
+
         # Execute routing (C++ bindings with numpy fallback)
         routed_flow = None
+        if layers and not HAS_DROUTE:
+            raise ModelExecutionError(
+                f"dRoute C++ bindings are required to route with {[str(p) for p in layers]}; "
+                "set DROUTE_TRANSFERS_FILE / DROUTE_LAKES_FILE to 'none' to route the tree only")
         if HAS_DROUTE:
             try:
                 routed_flow = self._route_with_droute(
-                    runoff_data, network_config, routing_method, routing_dt
+                    runoff_data, network_config, routing_method, routing_dt,
+                    time_index=time_index,
                 )
             except Exception as e:  # noqa: BLE001
+                if layers:
+                    raise ModelExecutionError(
+                        f"dRoute routing with transfers/lakes failed: {type(e).__name__}: {e}") from e
                 self.logger.warning(
                     f"dRoute C++ bindings failed ({e}), falling back to numpy routing."
                 )
@@ -394,7 +409,8 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         runoff: np.ndarray,
         network: Dict[str, Any],
         method: str,
-        dt: int
+        dt: int,
+        time_index=None,
     ) -> np.ndarray:
         """
         Route runoff using dRoute C++ bindings (pybind11).
@@ -465,12 +481,15 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
             net.add_reach(reach)
 
         net.build_topology()
-        topo_order = net.topological_order()
         self.logger.info(f"dRoute C++ network built: {net.num_reaches()} reaches, {net.num_junctions()} junctions")
 
         # Apply lake/reservoir config (settings/dRoute/droute_lakes.yaml) onto the
         # built network before the router is constructed. No-op if absent.
         self._apply_lakes(net, network)
+
+        # Hydrofabric layers beyond the tree: level-pool lake nodes (lakes.csv)
+        # and transfer edges (transfers.csv). No-op when neither is found.
+        self._apply_hydrofabric(net, network, time_index)
 
         # Configure router
         config = droute.RouterConfig()
@@ -478,6 +497,9 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         config.enable_gradients = False
 
         router = droute.MuskingumCungeRouter(net, config)
+        # Taken after transfers are added: they change the topological order of
+        # the combined graph, and get_all_discharges() follows that order.
+        topo_order = net.topological_order()
 
         # Route timestep-by-timestep.
         # NOTE: get_all_discharges() returns values ordered by the network's
@@ -521,6 +543,51 @@ class DRouteRunner(BaseModelRunner, DRouteConfigMixin):  # type: ignore[misc]
         except Exception as e:  # noqa: BLE001 - lakes optional, never block routing
             self.logger.warning(f"Lake config not applied: {type(e).__name__}: {e}")
             return 0
+
+    def _resolve_layer_file(self, setting: str, default_name: str) -> Optional[Path]:
+        """Resolve DROUTE_TRANSFERS_FILE / DROUTE_LAKES_FILE to a path (or None)."""
+        if setting is None or str(setting).lower() in ('none', 'off', 'false', ''):
+            return None
+        if str(setting).lower() == 'default':
+            topo = self._find_topology_file()
+            candidate = topo.parent / default_name if topo else None
+            return candidate if candidate is not None and candidate.exists() else None
+        path = Path(setting)
+        if not path.is_absolute():
+            path = self.get_config_path('SETTINGS_DROUTE_PATH', 'settings/dRoute/') / path
+        if not path.exists():
+            raise ModelExecutionError(f"dRoute layer file not found: {path}")
+        return path
+
+    def _apply_hydrofabric(self, net, network: Dict[str, Any], time_index=None) -> Dict[str, Any]:
+        """Apply lakes.csv and transfers.csv onto the built C++ network."""
+        transfers_path = self._resolve_layer_file(self.droute_transfers_file, 'transfers.csv')
+        lakes_path = self._resolve_layer_file(self.droute_lakes_file, 'lakes.csv')
+        if transfers_path is None and lakes_path is None:
+            return {}
+        if not network.get('segment_ids'):
+            raise ModelExecutionError(
+                "Network has no segment ids, so transfers.csv / lakes.csv cannot be matched to it")
+        sim_start_year = None
+        if time_index is not None and len(time_index) > 0:
+            t0 = time_index[0]
+            sim_start_year = t0.year + (t0.dayofyear - 1) / 365.25
+        summary = self.network_adapter.apply_hydrofabric(
+            net, network,
+            transfers_path=transfers_path,
+            lakes_path=lakes_path,
+            enable_groundwater=self.droute_enable_groundwater_transfers,
+            sim_start_year=sim_start_year,
+            transfer_defaults={
+                'capacity_factor': self.droute_transfer_capacity_factor,
+                'bifurcation_fraction': self.droute_bifurcation_fraction,
+            },
+            lake_params={'weir_c': self.droute_lake_weir_c},
+        )
+        self.logger.info(
+            f"dRoute hydrofabric layers: {summary.get('lakes', 0)} lake nodes, "
+            f"{len(summary.get('transfers', []))} transfers")
+        return summary
 
     def _route_numpy_fallback(
         self,

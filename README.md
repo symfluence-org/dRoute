@@ -14,6 +14,7 @@ A differentiable river routing library for hydrological modeling. dRoute impleme
 - **6 Routing Methods**: From simple lag routing to Saint-Venant equations
 - **Dual AD Backends**: CoDiPack (tape-based) and Enzyme (source-to-source) 
 - **Network Topology**: Full support for river networks with tributaries and confluences
+- **Transfers and storage nodes**: headraces, diversions, natural bifurcations, lagged groundwater edges and level-pool lakes/reservoirs, with differentiable parameters and a mass-balance check (see [docs/transfers_and_lakes.md](docs/transfers_and_lakes.md))
 - **PyTorch Integration**: Use dRoute gradients in ML training loops
 
 ## Routing Methods
@@ -113,6 +114,8 @@ dRoute/
 │   ├── unified_router.hpp      # EnzymeRouter wrapper
 │   ├── saint_venant_router.hpp # Full SVE with SUNDIALS CVODES
 │   ├── network.hpp             # Network topology
+│   ├── transfers.hpp           # Transfer edge types (headrace, bifurcation, ...)
+│   ├── transfer_routing.hpp    # Transfer/level-pool lake step logic, mass balance
 │   └── types.hpp               # AD type definitions
 ├── python/
 │   ├── bindings.cpp            # pybind11 bindings
